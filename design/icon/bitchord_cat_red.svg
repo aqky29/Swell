@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#E8183A"/>
+      <stop offset="1" stop-color="#E04A68"/>
+    </linearGradient>
+    <!-- White logo fading slightly toward the bottom, like the original lines -->
+    <linearGradient id="white" gradientUnits="userSpaceOnUse" x1="0" y1="160" x2="0" y2="372">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.88"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#8A0F25" flood-opacity="0.35"/>
+    </filter>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="6" flood-color="#7A0C20" flood-opacity="0.35"/>
+    </filter>
+
+    <!-- Cuts a small gap around the headphones so they stay readable on the white cat -->
+    <mask id="phoneGap" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="512">
+      <rect width="512" height="512" fill="#FFFFFF"/>
+      <path d="M160 282 A96 106 0 0 1 352 282" fill="none" stroke="#000" stroke-width="27" stroke-linecap="round"/>
+      <rect x="130" y="252" width="56" height="88" rx="26" fill="#000"/>
+      <rect x="326" y="252" width="56" height="88" rx="26" fill="#000"/>
+    </mask>
+
+    <!-- Face features cut out of the head -->
+    <mask id="face" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="512">
+      <rect width="512" height="512" fill="#FFFFFF"/>
+      <path d="M196 226 L199 190 L222 213 Z" fill="#000" stroke="#000" stroke-width="6" stroke-linejoin="round" opacity="0.35"/>
+      <path d="M316 226 L313 190 L290 213 Z" fill="#000" stroke="#000" stroke-width="6" stroke-linejoin="round" opacity="0.35"/>
+      <path d="M208 290 Q222 274 236 290" fill="none" stroke="#000" stroke-width="8" stroke-linecap="round"/>
+      <path d="M276 290 Q290 274 304 290" fill="none" stroke="#000" stroke-width="8" stroke-linecap="round"/>
+      <path d="M249 304 L263 304 L256 312 Z" fill="#000" stroke="#000" stroke-width="3" stroke-linejoin="round"/>
+      <path d="M240 318 Q248 330 256 316 Q264 330 272 318" fill="none" stroke="#000" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+      <ellipse cx="206" cy="314" rx="13" ry="8" fill="#000" opacity="0.18"/>
+      <ellipse cx="306" cy="314" rx="13" ry="8" fill="#000" opacity="0.18"/>
+    </mask>
+  </defs>
+
+  <!-- App tile -->
+  <!-- Shadow drawn separately so the gradient itself is not rasterized through a filter (avoids banding) -->
+  <rect x="56" y="56" width="400" height="400" rx="100" fill="#000" filter="url(#shadow)"/>
+  <rect x="56" y="56" width="400" height="400" rx="100" fill="url(#bg)"/>
+  <rect x="57" y="57" width="398" height="398" rx="99" fill="none" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="2"/>
+
+  <g filter="url(#soft)">
+    <!-- Cat (ears + head) -->
+    <g mask="url(#phoneGap)">
+      <g mask="url(#face)" fill="url(#white)" stroke="url(#white)" stroke-linejoin="round">
+        <path d="M182 252 L188 170 L240 222 Z" stroke-width="16"/>
+        <path d="M330 252 L324 170 L272 222 Z" stroke-width="16"/>
+        <ellipse cx="256" cy="292" rx="94" ry="78" stroke="none"/>
+      </g>
+    </g>
+
+    <!-- Headphones -->
+    <path d="M160 282 A96 106 0 0 1 352 282" fill="none" stroke="url(#white)" stroke-width="15" stroke-linecap="round"/>
+    <rect x="136" y="258" width="44" height="76" rx="20" fill="url(#white)"/>
+    <rect x="332" y="258" width="44" height="76" rx="20" fill="url(#white)"/>
+
+    <!-- Music notes -->
+    <g fill="url(#white)" stroke="url(#white)" stroke-linecap="round" stroke-linejoin="round">
+      <g transform="translate(374 176) rotate(12)">
+        <ellipse cx="0" cy="0" rx="11" ry="8" transform="rotate(-20)" stroke="none"/>
+        <path d="M9 -3 V-40 Q24 -34 25 -18" fill="none" stroke-width="5"/>
+      </g>
+      <g transform="translate(130 196) rotate(-14) scale(0.75)" opacity="0.85">
+        <ellipse cx="0" cy="0" rx="11" ry="8" transform="rotate(-20)" stroke="none"/>
+        <path d="M9 -3 V-40 Q24 -34 25 -18" fill="none" stroke-width="5"/>
+      </g>
+    </g>
+  </g>
+</svg>
