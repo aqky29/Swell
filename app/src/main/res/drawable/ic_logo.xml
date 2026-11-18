@@ -1,0 +1,16 @@
+<!--
+  The Swell mark: one wave, white so callers can tint it.
+  Kept on the old 730x484 viewport so every caller's aspect ratio still fits.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="28dp"
+    android:height="18.56dp"
+    android:viewportWidth="730"
+    android:viewportHeight="484">
+    <group android:scaleX="1.2474" android:scaleY="1.2474"
+        android:translateX="-273.68" android:translateY="-396.68">
+        <path android:pathData="M292,512 C371.2,312.5 432.8,312.5 512,512 C591.2,711.5 652.8,711.5 732,512"
+            android:strokeColor="#FFFFFFFF" android:strokeWidth="88"
+            android:strokeLineCap="round" android:fillColor="#00000000" />
+    </group>
+</vector>

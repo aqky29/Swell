@@ -1,0 +1,16 @@
+<!--
+  Status-bar / notification variant of the Swell mark. Drawn as a silhouette
+  (the system keeps only alpha), so the stroke is opaque white.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <group android:scaleX="0.041667" android:scaleY="0.041667"
+        android:translateX="-9.3333" android:translateY="-9.3333">
+        <path android:pathData="M292,512 C371.2,312.5 432.8,312.5 512,512 C591.2,711.5 652.8,711.5 732,512"
+            android:strokeColor="#FFFFFFFF" android:strokeWidth="88"
+            android:strokeLineCap="round" android:fillColor="#00000000" />
+    </group>
+</vector>
