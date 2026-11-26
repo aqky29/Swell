@@ -306,7 +306,7 @@ uniform float4 shape1;
 uniform float4 shape2;
 uniform float4 shape3;
 uniform float4 shapeAlpha;
-uniform float mergeDistance;
+uniform float3 mergeDistances;
 float3 groupShapeField(float2 point, float4 s, float a) {
     if (a <= 0.02 || s.z <= 0.0 || s.w <= 0.0) return float3(100000.0, 0.0, 0.0);
     float r = min(s.z, s.w);
@@ -315,19 +315,21 @@ float3 groupShapeField(float2 point, float4 s, float a) {
     f.x += fade * fade * r;
     return f;
 }
-float3 groupUnion(float3 a, float3 b) {
+float3 groupUnion(float3 a, float3 b, float mergeDist) {
     if (b.x > 50000.0) return a;
     if (a.x > 50000.0) return b;
-    float k = mergeDistance * clamp(0.5 - 0.5 * dot(a.yz, b.yz), 0.0, 1.0);
+    float k = mergeDist * clamp(0.5 - 0.5 * dot(a.yz, b.yz), 0.0, 1.0);
     if (k <= 0.000001) return a.x < b.x ? a : b;
-    float h = clamp(0.5 + 0.5 * (a.x - b.x) / k, 0.0, 1.0);
-    return float3(mix(a.x, b.x, h) - k * h * (1.0 - h), mix(a.yz, b.yz, h));
+    float h = max(k - abs(a.x - b.x), 0.0) / k;
+    float d = min(a.x, b.x) - h * h * h * k * (1.0 / 6.0);
+    float m = clamp(0.5 + 0.5 * (a.x - b.x) / k, 0.0, 1.0);
+    return float3(d, nativeGlassSafeNormal(mix(a.yz, b.yz, m)));
 }
 float3 liquidFieldGradient(float2 point) {
     float3 f = groupShapeField(point, shape0, shapeAlpha.x);
-    f = groupUnion(f, groupShapeField(point, shape1, shapeAlpha.y));
-    f = groupUnion(f, groupShapeField(point, shape2, shapeAlpha.z));
-    f = groupUnion(f, groupShapeField(point, shape3, shapeAlpha.w));
+    f = groupUnion(f, groupShapeField(point, shape1, shapeAlpha.y), mergeDistances.x);
+    f = groupUnion(f, groupShapeField(point, shape2, shapeAlpha.z), mergeDistances.y);
+    f = groupUnion(f, groupShapeField(point, shape3, shapeAlpha.w), mergeDistances.z);
     return f;
 }
 """

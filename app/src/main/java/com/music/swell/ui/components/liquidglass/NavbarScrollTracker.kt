@@ -535,6 +535,8 @@ object SearchableBarMorphCalculator {
     const val DEFAULT_SEARCH_BAR_HEIGHT_DP: Float = 50f
     const val DEFAULT_ACCESSORY_HEIGHT_DP: Float = 50f
     const val DEFAULT_SPACING_DP: Float = 8f
+    /** Celah diam Search saat amoeba merge aktif agar leher cairan sempat memutus bersih. */
+    const val AMOEBA_SEARCH_SPACING_DP: Float = 14f
     /** Celah mini player ke bar: iOS 27 sangat rapat, ~5pt. */
     const val DEFAULT_ACCESSORY_SPACING_DP: Float = 5f
     const val SEARCH_EXPAND_CONTENT_THRESHOLD_DP: Float = 90f
@@ -555,6 +557,10 @@ object SearchableBarMorphCalculator {
     /**
      * Menghitung target pegas (`targetTabW`, `targetSearchLeft`, `targetSearchW`, `targetBarHeight`)
      * persis seperti `SearchableBottomBarController.computeLayout` di Flutter.
+     *
+     * Bila [amoebaMerge] `true` (grup kaca SDF aktif), saat Normal kapsul Tab dan Search dibuat
+     * bertindihan tepat sebesar [barHeightDp] (`2 × radius`) agar garis atas/bawah 100% lurus
+     * rata tanpa lekukan, lalu membelah dan menyatu dengan leher amoeba tanpa menimpa dari kanan.
      */
     fun computeTargets(
         totalWidthDp: Float,
@@ -562,9 +568,11 @@ object SearchableBarMorphCalculator {
         barHeightDp: Float = DEFAULT_BAR_HEIGHT_DP,
         searchBarHeightDp: Float = DEFAULT_SEARCH_BAR_HEIGHT_DP,
         spacingDp: Float = DEFAULT_SPACING_DP,
-        showsCancelButton: Boolean = true
+        showsCancelButton: Boolean = true,
+        amoebaMerge: Boolean = false
     ): SearchablePillMorphTargets {
-        val safeTotalW = totalWidthDp.coerceAtLeast(barHeightDp * 2f + spacingDp)
+        val effectiveSpacing = if (amoebaMerge) AMOEBA_SEARCH_SPACING_DP else spacingDp
+        val safeTotalW = totalWidthDp.coerceAtLeast(barHeightDp * 2f + effectiveSpacing)
         // Di home_screen.dart: isSearchActive pada GlassTabBar.searchable = _miniMode || _searching
         val isBarCollapsed = uiState.isTabCapsuleCollapsed
         // Di home_screen.dart: expandWhenActive = !_miniMode || _searching (yaitu uiState.isSearchActive)
@@ -572,29 +580,40 @@ object SearchableBarMorphCalculator {
 
         val targetH = if (isBarCollapsed) searchBarHeightDp else barHeightDp
         val dismissVisible = uiState.isSearchActive && uiState.isSearchFocused && showsCancelButton
-        val dismissReserve = if (showsCancelButton) targetH + spacingDp else 0f
+        val dismissReserve = if (showsCancelButton) targetH + effectiveSpacing else 0f
 
-        // Saat normal: kapsul tab selebar bar, dengan Search sebagai slot terakhir di dalamnya
-        // (iOS 27). Search Orb menunggu tersembunyi di ujung kanan kapsul dan baru lepas sebagai
-        // orb sendiri saat kapsul menciut (Mini Mode atau Search).
-        val targetTabW = if (!isBarCollapsed) safeTotalW else targetH
+        // Saat Normal + amoebaMerge: Search mengambil sisi kanan ~100dp dan Tab berakhir tepat
+        // 60dp (= 2*R) di kanannya, sehingga garis datar atas & bawah bertemu tangen tanpa lekukan.
+        val normalSearchW = if (amoebaMerge) {
+            (barHeightDp * 1.67f).coerceIn(barHeightDp, safeTotalW * 0.45f)
+        } else {
+            targetH
+        }
+        val normalTabW = if (amoebaMerge) {
+            (safeTotalW - normalSearchW + barHeightDp).coerceAtMost(safeTotalW)
+        } else {
+            safeTotalW
+        }
+
+        val targetTabW = if (!isBarCollapsed) normalTabW else targetH
 
         // Posisi kiri Search Pill:
-        // - Normal / Mini Mode: berada di ujung kanan (safeTotalW - targetH)
-        // - Search Aktif (belum fokus keyboard): berada di kanan orb tab 50.dp (targetTabW + spacing)
-        // - Search Fokus: meluncur ke tepi paling kiri (0.dp) sementara DismissPill (x) muncul di kanan
+        // - Normal: berada di ujung kanan (safeTotalW - normalSearchW)
+        // - Search Aktif (belum fokus keyboard): berada di kanan orb tab (targetTabW + spacing)
+        // - Search Fokus: meluncur ke tepi paling kiri (0.dp) sementara DismissPill (x) membelah di kanan
         val targetSearchLeft = when {
-            !isBarCollapsed || !expandSearch -> (safeTotalW - targetH).coerceAtLeast(0f)
+            !isBarCollapsed -> (safeTotalW - normalSearchW).coerceAtLeast(0f)
+            !expandSearch -> (safeTotalW - targetH).coerceAtLeast(0f)
             uiState.isSearchFocused -> 0f
-            else -> targetTabW + spacingDp
+            else -> targetTabW + effectiveSpacing
         }
 
         // Lebar Search Pill:
-        // - Normal: 64.dp (lingkaran)
-        // - Mini Mode: 50.dp (lingkaran)
+        // - Normal: normalSearchW (menyatu mulus di dalam grup SDF)
         // - Search Aktif: membentang memenuhi sisa ruang (dikurangi ruang DismissPill saat fokus)
         val targetSearchW = when {
-            !isBarCollapsed || !expandSearch -> targetH
+            !isBarCollapsed -> normalSearchW
+            !expandSearch -> targetH
             else -> (safeTotalW - targetSearchLeft - (if (dismissVisible) dismissReserve else 0f))
                 .coerceAtLeast(targetH)
         }

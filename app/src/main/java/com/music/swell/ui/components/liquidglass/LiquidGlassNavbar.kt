@@ -149,7 +149,18 @@ private const val MORPH_EFFECT_FADE_IN_MS = 200
  * seperti tetesan saat berdekatan (LiquidGlassGroup). `false` = tiap elemen menggambar kacanya
  * sendiri seperti sebelumnya.
  */
-private const val MERGE_GLASS_SHAPES = false
+private const val MERGE_GLASS_SHAPES = true
+
+/** Jarak smooth-min amoeba (dp) saat Tab ↔ Search atau Search ↔ × membelah & menyatu. */
+private const val AMOEBA_MERGE_K_DP = 38f
+
+/** Jarak smooth-min kecil (dp) untuk MiniPlayerPill agar tidak melengket ke atas bar di celah 5.dp. */
+private const val ACCESSORY_MERGE_K_DP = 4f
+
+private fun smoothstep(t: Float): Float {
+    val c = t.coerceIn(0f, 1f)
+    return c * c * (3f - 2f * c)
+}
 
 /** Rentang (dp) tepi kapsul melewati orb Search selama orb itu lepas atau terserap. */
 private const val ORB_PINCH_DP = 6f
@@ -248,17 +259,53 @@ fun LiquidGlassSearchableTabBar(
             .padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 20.dp)
     ) {
         val totalWidthDp = maxWidth.value
-        val targets = remember(totalWidthDp, uiState) {
+        val density = LocalDensity.current
+        // Satu blur latar untuk seluruh grup (tab, search, mini player), lihat SharedGlassBackdrop.
+        // Region setinggi kontainer terbesar (mini player di atas bar) + margin efek tekan.
+        val sharedBackdrop = rememberSharedGlassBackdrop(
+            backdropState = backdropState,
+            blurRadius = barGlassSettings.blurRadiusDp.dp,
+            enabled = glassMode != GlassEffectMode.SOLID,
+            saturation = barGlassSettings.backdropSaturation(glassMode)
+        )
+        val sharedRegionHeightPx = with(density) {
+            (SearchableBarMorphCalculator.DEFAULT_BAR_HEIGHT_DP +
+                SearchableBarMorphCalculator.DEFAULT_ACCESSORY_SPACING_DP +
+                SearchableBarMorphCalculator.DEFAULT_ACCESSORY_HEIGHT_DP).dp.toPx()
+        }
+        val sharedRegionMarginPx = with(density) { 24.dp.toPx() }
+
+        // Semua kapsul digambar sebagai satu kaca yang bisa menyatu seperti amoeba (iOS
+        // GlassEffectContainer). Hanya di Premium + AGSL; mode lain menggambar per elemen.
+        val barBlurPx = with(density) { barGlassSettings.blurRadiusDp.dp.toPx() }
+        val pillBlurPx = with(density) { pillGlassSettings.blurRadiusDp.dp.toPx() }
+        val glassGroup = rememberLiquidGlassGroup(
+            slotCount = GROUP_SLOT_COUNT,
+            enabled = MERGE_GLASS_SHAPES &&
+                glassMode == GlassEffectMode.PREMIUM &&
+                sharedBackdrop.matches(barBlurPx) &&
+                sharedBackdrop.matches(pillBlurPx)
+        )
+        val amoebaMerge = glassGroup.enabled
+
+        val targets = remember(totalWidthDp, uiState, amoebaMerge) {
             SearchableBarMorphCalculator.computeTargets(
                 totalWidthDp = totalWidthDp,
-                uiState = uiState
+                uiState = uiState,
+                amoebaMerge = amoebaMerge
             )
         }
 
         // Tiga sumbu pegas utama dari SearchableBottomBarController (_tabWCtrl, _searchLeftCtrl, _searchWCtrl).
         // Menciut karena scroll (mini mode) dan kembali darinya memakai pegas iOS 27 yang tidak
-        // simetris; morph pencarian tetap memakai _kSpring.
-        val miniMorph = uiState.isMiniMode || !uiState.isSearchActive
+        // simetris; morph pencarian (buka maupun tutup) tetap memakai _kSpring.
+        var lastMorphWasSearch by remember { mutableStateOf(false) }
+        if (uiState.isSearchActive) {
+            lastMorphWasSearch = true
+        } else if (uiState.isMiniMode) {
+            lastMorphWasSearch = false
+        }
+        val miniMorph = uiState.isMiniMode || !lastMorphWasSearch
         val reduceMotion = rememberReduceMotion()
         val morphSpring: FiniteAnimationSpec<Float> = remember(uiState.isTabCapsuleCollapsed, miniMorph, reduceMotion) {
             when {
@@ -362,17 +409,34 @@ fun LiquidGlassSearchableTabBar(
             label = "tabPillFocusVisibility"
         )
 
-        // Selama Search masih bulat (scroll menciut/mekar), orb lepas dari ujung kanan kapsul:
-        // baru tampak saat tepi kapsul melewatinya, dan terserap lagi saat kapsul tumbuh
-        // menutupinya. Memudar di tempat membuat dua kaca sempat bertumpuk (kesan stiker).
-        // Saat orb melebar jadi kolom pencarian, tetap memakai pudar biasa.
-        fun searchOrbVisibility(): Float =
-            if (searchWidth.value <= barHeight.value + 4f) {
-                val separationDp = searchLeft.value - (tabLeft.value + tabWidthAnim.value)
+        // Progres membentangnya kapsul tab (1f = penuh 3 tab, 0f = menciut jadi orb 50.dp)
+        val normalBarH = SearchableBarMorphCalculator.DEFAULT_BAR_HEIGHT_DP
+        val fullExpandedTabW = if (amoebaMerge) {
+            val normalSearchW = (normalBarH * 1.67f).coerceIn(normalBarH, totalWidthDp * 0.45f)
+            (totalWidthDp - normalSearchW + normalBarH).coerceIn(normalBarH, totalWidthDp)
+        } else {
+            totalWidthDp.coerceAtLeast(normalBarH)
+        }
+        val collapsedTabW = SearchableBarMorphCalculator.DEFAULT_SEARCH_BAR_HEIGHT_DP
+        val tabExpandFraction: () -> Float = {
+            ((tabWidthAnim.value - collapsedTabW) / (fullExpandedTabW - collapsedTabW).coerceAtLeast(1f))
+                .coerceIn(0f, 1f)
+        }
+
+        // Visibilitas luar pil Search:
+        // - Saat amoebaMerge aktif: MorphingGlassSearchPill adalah SATU-SATUNYA ikon Search
+        //   (slot ke-4 saat Normal -> orb saat Mini Mode -> input saat Search), jadi selalu 1f.
+        // - Saat fallback non-grup: tetap gunakan pinch/crossfade agar tidak menimpa label tab.
+        fun searchOrbVisibility(): Float {
+            if (amoebaMerge) return 1f
+            val separationDp = searchLeft.value - (tabLeft.value + tabWidthAnim.value)
+            return if (searchWidth.value <= barHeight.value + 4f) {
                 ((separationDp + ORB_PINCH_DP) / (2f * ORB_PINCH_DP)).coerceIn(0f, 1f)
             } else {
-                searchOrbFade.value
+                val tabCleared = (1f - ((tabExpandFraction() - 0.15f) / 0.30f).coerceIn(0f, 1f))
+                (searchOrbFade.value * tabCleared).coerceIn(0f, 1f)
             }
+        }
 
         // Tidak pernah lebih sempit dari lebarnya saat sebaris: menyempit lalu melebar lagi
         // terlihat memompa, dan judulnya sempat terpotong jadi "…".
@@ -425,14 +489,6 @@ fun LiquidGlassSearchableTabBar(
             }
         }
 
-        // Progres membentangnya kapsul tab (1f = penuh 3 tab, 0f = menciut jadi orb 50.dp)
-        val fullExpandedTabW = totalWidthDp.coerceAtLeast(SearchableBarMorphCalculator.DEFAULT_BAR_HEIGHT_DP)
-        val collapsedTabW = SearchableBarMorphCalculator.DEFAULT_SEARCH_BAR_HEIGHT_DP
-        val tabExpandFraction: () -> Float = {
-            ((tabWidthAnim.value - collapsedTabW) / (fullExpandedTabW - collapsedTabW).coerceAtLeast(1f))
-                .coerceIn(0f, 1f)
-        }
-
         // Animasi morph masih berjalan? Efek mahal dipudarkan (bukan dimatikan) selama transisi.
         // derivedStateOf: dihitung tiap frame, tetapi komposisi hanya ikut saat jawabannya berubah.
         val isMorphing by remember(targets) {
@@ -461,33 +517,6 @@ fun LiquidGlassSearchableTabBar(
             if (REFRACTION_DURING_MORPH) ({ 1f }) else ({ morphEffectFade.value })
         }
 
-        // Satu blur latar untuk seluruh grup (tab, search, mini player), lihat SharedGlassBackdrop.
-        // Region setinggi kontainer terbesar (mini player di atas bar) + margin efek tekan.
-        val sharedBackdrop = rememberSharedGlassBackdrop(
-            backdropState = backdropState,
-            blurRadius = barGlassSettings.blurRadiusDp.dp,
-            enabled = glassMode != GlassEffectMode.SOLID,
-            saturation = barGlassSettings.backdropSaturation(glassMode)
-        )
-        val density = LocalDensity.current
-        val sharedRegionHeightPx = with(density) {
-            (SearchableBarMorphCalculator.DEFAULT_BAR_HEIGHT_DP +
-                SearchableBarMorphCalculator.DEFAULT_ACCESSORY_SPACING_DP +
-                SearchableBarMorphCalculator.DEFAULT_ACCESSORY_HEIGHT_DP).dp.toPx()
-        }
-        val sharedRegionMarginPx = with(density) { 24.dp.toPx() }
-
-        // Semua kapsul digambar sebagai satu kaca yang bisa menyatu seperti tetesan (iOS
-        // GlassEffectContainer). Hanya di Premium + AGSL; mode lain menggambar per elemen.
-        val barBlurPx = with(density) { barGlassSettings.blurRadiusDp.dp.toPx() }
-        val pillBlurPx = with(density) { pillGlassSettings.blurRadiusDp.dp.toPx() }
-        val glassGroup = rememberLiquidGlassGroup(
-            slotCount = GROUP_SLOT_COUNT,
-            enabled = MERGE_GLASS_SHAPES &&
-                glassMode == GlassEffectMode.PREMIUM &&
-                sharedBackdrop.matches(barBlurPx) &&
-                sharedBackdrop.matches(pillBlurPx)
-        )
         val tabSlot = glassGroup.slot(GROUP_SLOT_TABS)
         val searchSlot = glassGroup.slot(GROUP_SLOT_SEARCH)
         val dismissSlot = glassGroup.slot(GROUP_SLOT_DISMISS)
@@ -503,8 +532,14 @@ fun LiquidGlassSearchableTabBar(
         tabSlot.bindOuterTransform {
             val visibility = tabPillVisibility.value
             alpha = if (showTabCapsule) visibility else 0f
-            scaleX = 0.85f + 0.15f * visibility
-            scaleY = scaleX
+            val scale = 0.85f + 0.15f * visibility
+            scaleX = scale
+            scaleY = scale * (1f + liquidBulge(tabWidthAnim.velocity))
+        }
+        // Saat amoebaMerge aktif, Search selalu hadir (1f) sebagai belahan kanan kapsul utuh saat
+        // Normal (overlap tepat barHeightDp = 2*R -> rata 100%) dan membentuk leher amoeba saat memisah.
+        searchSlot.bindOuterTransform {
+            alpha = 1f
         }
         dismissSlot.bindOuterTransform {
             val scale = dismissPillScale.value
@@ -512,6 +547,26 @@ fun LiquidGlassSearchableTabBar(
             scaleX = scale
             scaleY = scale
         }
+
+        // Jarak smooth-min dinamis (dp): besar (38dp) selama amoeba membelah/menyatu, lalu melandai
+        // ke 0 tepat sebelum celah diam 14dp agar kapsul diam tetap tajam tanpa benjolan sisa.
+        val isSearchActiveState by rememberUpdatedState(uiState.isSearchActive)
+        val mergeK01Dp: () -> Float = {
+            val gap01 = searchLeft.value - (tabLeft.value + tabWidthAnim.value)
+            val snapFade = if (isSearchActiveState) {
+                1f - smoothstep((gap01 - 10f) / 3.6f)
+            } else {
+                1f - smoothstep((gap01 - 24f) / 30f)
+            }
+            AMOEBA_MERGE_K_DP * snapFade
+        }
+        val mergeK12Dp: () -> Float = {
+            val dismissLeft = totalWidthDp - barHeight.value
+            val gap12 = dismissLeft - (searchLeft.value + searchWidth.value)
+            val snapFade = 1f - smoothstep((gap12 - 10f) / 3.6f)
+            AMOEBA_MERGE_K_DP * snapFade
+        }
+        val mergeKAccDp: () -> Float = { ACCESSORY_MERGE_K_DP }
 
         Box(
             modifier = Modifier
@@ -530,6 +585,9 @@ fun LiquidGlassSearchableTabBar(
                 backdropState = backdropState,
                 settings = barGlassSettings,
                 isDark = isDark,
+                mergeK01Dp = mergeK01Dp,
+                mergeK12Dp = mergeK12Dp,
+                mergeKAccDp = mergeKAccDp,
                 modifier = Modifier.matchParentSize()
             )
 
@@ -601,6 +659,8 @@ fun LiquidGlassSearchableTabBar(
                         expandFraction = tabExpandFraction,
                         widthDp = { tabWidthAnim.value.coerceAtLeast(1f) },
                         barHeightDp = { barHeight.value },
+                        fullBarWidthDp = totalWidthDp,
+                        ownsSearchIcon = !amoebaMerge,
                         isDark = isDark,
                         backdropState = backdropState,
                         glassSettings = barGlassSettings,
@@ -635,29 +695,27 @@ fun LiquidGlassSearchableTabBar(
                 }
             }
 
-            // ── 3. Kapsul Search Kanan (Morphing Search Circle Orb <-> Expanded Search Field) ──
+            // ── 3. Kapsul Search Kanan (Morphing Search Slot/Orb <-> Expanded Search Field) ──
             Box(
                 modifier = Modifier
                     .align(Alignment.BottomStart)
                     .offset { IntOffset(searchLeft.value.dp.roundToPx(), -rowLift.value.dp.roundToPx()) }
+                    .zIndex(if (uiState.isTabCapsuleCollapsed) 1f else 0f)
                     .layoutSizeDp(
                         width = { searchWidth.value.coerceAtLeast(1f) },
                         height = { barHeight.value }
                     )
                     .liquidGlassGroupSlot(searchSlot)
-                    .graphicsLayer {
-                        val visibility = searchOrbVisibility()
-                        alpha = visibility
-                        val scale = 0.85f + 0.15f * visibility
-                        scaleX = scale
-                        scaleY = scale
-                    }
             ) {
                 MorphingGlassSearchPill(
                     query = uiState.searchQuery,
                     isSearchActive = uiState.isSearchActive,
                     isSearchFocused = uiState.isSearchFocused,
                     currentWidthDp = { searchWidth.value },
+                    amoebaMerge = amoebaMerge,
+                    tabExpandFraction = tabExpandFraction,
+                    searchSelected = uiState.isSearchCovered,
+                    fullBarWidthDp = totalWidthDp,
                     isDark = isDark,
                     backdropState = backdropState,
                     glassSettings = barGlassSettings,
@@ -679,7 +737,15 @@ fun LiquidGlassSearchableTabBar(
                     },
                     placeholder = searchPlaceholder,
                     groupSlot = searchSlot,
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            val visibility = searchOrbVisibility()
+                            alpha = visibility
+                            val scale = if (searchSlot != null) 1f else (0.85f + 0.15f * visibility)
+                            scaleX = scale
+                            scaleY = scale
+                        }
                 )
             }
 
@@ -782,6 +848,10 @@ private fun MorphingGlassTabsCapsule(
     expandFraction: () -> Float,
     widthDp: () -> Float,
     barHeightDp: () -> Float,
+    /** Lebar penuh baris bar (untuk grid 4 slot saat amoebaMerge aktif dan kapsul tab 310.dp). */
+    fullBarWidthDp: Float,
+    /** `false` saat amoebaMerge aktif: ikon Search tunggal digambar oleh MorphingGlassSearchPill. */
+    ownsSearchIcon: Boolean = true,
     isDark: Boolean,
     backdropState: LiquidGlassBackdropState,
     glassSettings: LiquidGlassSettings,
@@ -823,7 +893,9 @@ private fun MorphingGlassTabsCapsule(
         val currentWidthDp by rememberUpdatedState(widthDp)
         val currentBarHeightDp by rememberUpdatedState(barHeightDp)
         val widthPx: () -> Float = { with(density) { currentWidthDp().dp.toPx() } }
-        val tabWidthPx: () -> Float = { ((widthPx() - pad4Px * 2f) / slotCount).coerceAtLeast(1f) }
+        val gridWidthDp: () -> Float = { if (ownsSearchIcon) currentWidthDp() else fullBarWidthDp }
+        val gridWidthPx: () -> Float = { with(density) { gridWidthDp().dp.toPx() } }
+        val tabWidthPx: () -> Float = { ((gridWidthPx() - pad4Px * 2f) / slotCount).coerceAtLeast(1f) }
         // Kyant0: bar 64.dp dengan padding 4.dp, indikator & baris beraksen 56.dp
         val rowHeightPx: () -> Float = {
             (with(density) { currentBarHeightDp().dp.toPx() } - pad4Px * 2f).coerceAtLeast(1f)
@@ -999,10 +1071,20 @@ private fun MorphingGlassTabsCapsule(
             ) {
                 // A. Baris tab biasa (warna konten polos, dapat diketuk)
                 if (showTabs) {
+                    val threeTabWidthDp = 4f + ((fullBarWidthDp - 8f) / slotCount) * tabCount
                     Row(
                         modifier = Modifier
-                            .fillMaxSize()
-                            .padding(4.dp)
+                            .then(
+                                if (ownsSearchIcon) {
+                                    Modifier.fillMaxSize().padding(4.dp)
+                                } else {
+                                    Modifier
+                                        .align(Alignment.CenterStart)
+                                        .width(threeTabWidthDp.dp)
+                                        .fillMaxHeight()
+                                        .padding(start = 4.dp, top = 4.dp, bottom = 4.dp)
+                                }
+                            )
                             .graphicsLayer {
                                 val contentAlpha = tabsContentAlpha()
                                 alpha = contentAlpha
@@ -1021,12 +1103,14 @@ private fun MorphingGlassTabsCapsule(
                                 onClick = if (isCollapsed) null else ({ currentIndex = tab.index })
                             )
                         }
-                        KyantBottomItem(
-                            icon = Icons.Rounded.Search,
-                            label = stringResource(R.string.search),
-                            color = contentColor,
-                            onClick = if (isCollapsed) null else onSearchTap
-                        )
+                        if (ownsSearchIcon) {
+                            KyantBottomItem(
+                                icon = Icons.Rounded.Search,
+                                label = stringResource(R.string.search),
+                                color = contentColor,
+                                onClick = if (isCollapsed) null else onSearchTap
+                            )
+                        }
                     }
                 }
 
@@ -1073,7 +1157,13 @@ private fun MorphingGlassTabsCapsule(
             // ── 2. Baris tab beraksen tak terlihat, direkam ke tabsLayer (Kyant0 `layerBackdrop`) ──
             Box(
                 modifier = Modifier
-                    .matchParentSize()
+                    .align(Alignment.TopStart)
+                    .layout { measurable, _ ->
+                        val w = gridWidthPx().roundToInt().coerceAtLeast(1)
+                        val h = with(density) { currentBarHeightDp().dp.roundToPx() }.coerceAtLeast(1)
+                        val placeable = measurable.measure(Constraints.fixed(w, h))
+                        layout(placeable.width, placeable.height) { placeable.place(0, 0) }
+                    }
                     .padding(vertical = 4.dp)
                     .clearAndSetSemantics {}
                     .graphicsLayer { translationX = panelOffset }
@@ -1130,8 +1220,7 @@ private fun MorphingGlassTabsCapsule(
             }
 
             // ── 3. Indikator lensa kaca yang dapat ditekan & digeser ──
-            if (showTabLayers) {
-                LiquidGlassTabIndicator(
+            LiquidGlassTabIndicator(
                     backdropState = backdropState,
                     tabsLayer = tabsLayer,
                     groupOriginInRoot = { groupOriginInRoot },
@@ -1164,8 +1253,7 @@ private fun MorphingGlassTabsCapsule(
                             val placeable = measurable.measure(Constraints.fixed(width, height))
                             layout(width, height) { placeable.place(0, 0) }
                         }
-                )
-            }
+            )
         }
     }
 }
@@ -1253,6 +1341,11 @@ private fun MorphingGlassSearchPill(
     isSearchFocused: Boolean,
     /** Lebar pil saat ini; dibaca hanya di draw dan untuk ambang tata letak, berubah tiap frame. */
     currentWidthDp: () -> Float,
+    /** `true` saat amoebaMerge aktif: pil ini memegang satu-satunya ikon Search (slot 4 -> orb -> input). */
+    amoebaMerge: Boolean = false,
+    tabExpandFraction: () -> Float = { 0f },
+    searchSelected: Boolean = false,
+    fullBarWidthDp: Float = 0f,
     isDark: Boolean,
     backdropState: LiquidGlassBackdropState,
     glassSettings: LiquidGlassSettings,
@@ -1273,10 +1366,19 @@ private fun MorphingGlassSearchPill(
     var isPressed by remember { mutableStateOf(false) }
     var touchOffset by remember { mutableStateOf(Offset.Unspecified) }
     val currentOnExpandSearch by androidx.compose.runtime.rememberUpdatedState(onExpandSearch)
+    val currentIsSearchActive by rememberUpdatedState(isSearchActive)
+    val currentTabExpand by rememberUpdatedState(tabExpandFraction)
 
+    val isFusedNormal by remember(amoebaMerge, isSearchActive) {
+        derivedStateOf { amoebaMerge && !isSearchActive && currentTabExpand() > 0.5f }
+    }
     val pressScale by animateFloatAsState(
         targetValue = if (isPressed) {
-            if (isSearchActive) 1.03f else ORB_PRESSED_SCALE
+            when {
+                isFusedNormal -> 1.0f
+                isSearchActive -> 1.03f
+                else -> ORB_PRESSED_SCALE
+            }
         } else {
             1.0f
         },
@@ -1290,22 +1392,44 @@ private fun MorphingGlassSearchPill(
 
     val textColor = if (isDark) Color.White else Color(0xFF141416)
     val hintColor = if (isDark) Color.White.copy(alpha = 0.54f) else Color.Black.copy(alpha = 0.45f)
-    val collapsedIconColor = if (isDark) {
-        Color.White.copy(alpha = 0.90f)
-    } else {
-        Color.Black.copy(alpha = 0.75f)
+    val accentColor = if (isDark) Color(0xFF0091FF) else Color(0xFF0088FF)
+    val collapsedIconColor = when {
+        amoebaMerge && searchSelected && isFusedNormal -> accentColor
+        amoebaMerge && isFusedNormal -> if (isDark) Color.White else Color.Black
+        isDark -> Color.White.copy(alpha = 0.90f)
+        else -> Color.Black.copy(alpha = 0.75f)
     }
 
     val widthDp by rememberUpdatedState(currentWidthDp)
     val expandedContentAlpha: () -> Float = {
-        ((widthDp() - SearchableBarMorphCalculator.SEARCH_EXPAND_CONTENT_THRESHOLD_DP) / 70f).coerceIn(0f, 1f)
+        if (!currentIsSearchActive) {
+            0f
+        } else {
+            val widthReady = ((widthDp() - SearchableBarMorphCalculator.SEARCH_EXPAND_CONTENT_THRESHOLD_DP) / 70f)
+                .coerceIn(0f, 1f)
+            val tabCleared = if (amoebaMerge) {
+                1f - ((currentTabExpand() - 0.15f) / 0.30f).coerceIn(0f, 1f)
+            } else {
+                1f
+            }
+            (widthReady * tabCleared).coerceIn(0f, 1f)
+        }
     }
     val collapsedIconAlpha: () -> Float = { (1f - expandedContentAlpha() * 1.5f).coerceIn(0f, 1f) }
+    val slotLabelAlpha: () -> Float = {
+        if (!amoebaMerge) {
+            0f
+        } else {
+            (((currentTabExpand() - 0.35f) / 0.45f).coerceIn(0f, 1f) * (1f - expandedContentAlpha()))
+                .coerceIn(0f, 1f)
+        }
+    }
     val wideEnough by remember {
         derivedStateOf { widthDp() >= SearchableBarMorphCalculator.SEARCH_EXPAND_CONTENT_THRESHOLD_DP }
     }
     val isExpandedLayout = isSearchActive && wideEnough
     val showCollapsedIcon by remember { derivedStateOf { collapsedIconAlpha() > 0.01f } }
+    val showSlotLabel by remember { derivedStateOf { slotLabelAlpha() > 0.02f } }
 
     // Opening Search means typing: focus the field (and so raise the keyboard)
     // as soon as the pill has grown wide enough to hold it. Not when it opens on
@@ -1377,23 +1501,69 @@ private fun MorphingGlassSearchPill(
             }
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            // 1. Ikon Search terpusat saat berbentuk Orb bulat (< 90.dp)
+            // 1. Ikon Search tunggal: sejajar slot ke-4 (+ label) saat menyatu Normal, lalu
+            //    bergeser mulus ke tengah orb saat Mini Mode sebelum memudar menjadi kolom input.
             if (showCollapsedIcon) {
+                val slot4WidthDp = if (amoebaMerge && fullBarWidthDp > 0f) {
+                    ((fullBarWidthDp - 8f) / (MusicTab.entries.size + 1)).coerceAtLeast(44f)
+                } else {
+                    0f
+                }
                 Box(
                     modifier = Modifier
-                        .fillMaxSize()
+                        .align(Alignment.CenterEnd)
+                        .fillMaxHeight()
+                        .layout { measurable, constraints ->
+                            val fusedBlend = if (amoebaMerge && slot4WidthDp > 0f) {
+                                ((currentTabExpand() - 0.35f) / 0.65f).coerceIn(0f, 1f)
+                            } else {
+                                0f
+                            }
+                            val targetW = if (fusedBlend > 0.001f) {
+                                lerp(constraints.maxWidth.toFloat(), slot4WidthDp.dp.toPx(), fusedBlend)
+                                    .roundToInt()
+                                    .coerceIn(1, constraints.maxWidth.coerceAtLeast(1))
+                            } else {
+                                constraints.maxWidth.coerceAtLeast(1)
+                            }
+                            val endPadPx = (4.dp.toPx() * fusedBlend).roundToInt()
+                            val placeable = measurable.measure(
+                                Constraints.fixed(targetW, constraints.maxHeight.coerceAtLeast(1))
+                            )
+                            layout(constraints.maxWidth, constraints.maxHeight) {
+                                val x = (constraints.maxWidth - targetW - endPadPx).coerceAtLeast(0)
+                                placeable.place(x, 0)
+                            }
+                        }
                         .graphicsLayer {
                             alpha = collapsedIconAlpha()
                             compositingStrategy = CompositingStrategy.ModulateAlpha
                         },
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(
-                        imageVector = Icons.Rounded.Search,
-                        contentDescription = stringResource(R.string.search_field_description),
-                        tint = collapsedIconColor,
-                        modifier = Modifier.size(24.dp)
-                    )
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(2.dp, Alignment.CenterVertically)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Search,
+                            contentDescription = stringResource(R.string.search_field_description),
+                            tint = collapsedIconColor,
+                            modifier = Modifier.size(if (showSlotLabel) 28.dp else 24.dp)
+                        )
+                        if (showSlotLabel) {
+                            Text(
+                                text = stringResource(R.string.search),
+                                color = collapsedIconColor,
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                modifier = Modifier.graphicsLayer {
+                                    alpha = slotLabelAlpha()
+                                    compositingStrategy = CompositingStrategy.ModulateAlpha
+                                }
+                            )
+                        }
+                    }
                 }
             }
 

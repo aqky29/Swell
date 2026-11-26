@@ -139,9 +139,8 @@ private fun LiquidGlassGroupSlot?.bindTransform(outer: Boolean, block: GlassShap
 }
 
 /**
- * Jarak smooth-min. Kontur hanya berubah saat celah < nilai ini, dan baru tersambung saat celah
- * < setengahnya, jadi kapsul hanya melebur saat hampir bersentuhan. 12dp terlalu lebay: celah
- * 8dp saat diam ikut menggembung dan leher cairan terlihat sepanjang morph.
+ * Jarak smooth-min bawaan (dp) antara baris tab dan MiniPlayerPill di atasnya (celah diam 5.dp),
+ * sehingga MiniPlayerPill tidak ikut melengket ke atas kapsul tab.
  */
 private val GROUP_MERGE_DISTANCE = 4.dp
 
@@ -151,6 +150,10 @@ private val GROUP_SURFACE_MARGIN = 28.dp
 /**
  * Permukaan kaca seluruh grup. Pasang sebagai anak PERTAMA wadah grup dengan
  * `Modifier.matchParentSize()`, sehingga digambar di bawah konten setiap elemen.
+ *
+ * [mergeK01Dp] (Tab ↔ Search), [mergeK12Dp] (Search ↔ Dismiss), dan [mergeKAccDp] (Baris ↔
+ * MiniPlayer) dibaca langsung pada fase draw agar leher cairan amoeba dapat berubah dinamis tiap
+ * frame tanpa memicu recompose.
  */
 @Composable
 fun LiquidGlassGroupSurface(
@@ -159,7 +162,10 @@ fun LiquidGlassGroupSurface(
     backdropState: LiquidGlassBackdropState,
     settings: LiquidGlassSettings,
     isDark: Boolean,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    mergeK01Dp: () -> Float = { GROUP_MERGE_DISTANCE.value },
+    mergeK12Dp: () -> Float = { GROUP_MERGE_DISTANCE.value },
+    mergeKAccDp: () -> Float = { GROUP_MERGE_DISTANCE.value }
 ) {
     if (!group.enabled || !sharedBackdrop.enabled || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
 
@@ -218,8 +224,17 @@ fun LiquidGlassGroupSurface(
                     holder.alphas[i] = (outerScratch.alpha * innerScratch.alpha).coerceIn(0f, 1f)
                 }
                 for (i in group.allSlots.size until LiquidGlassGroup.MAX_SHAPES) holder.alphas[i] = 0f
-                val effect = holder.buildRenderEffect(look, layerWidth.toFloat(), layerHeight.toFloat())
-                    ?: return@drawBehind
+                val k01Px = (mergeK01Dp() * density.density).coerceAtLeast(0f)
+                val k12Px = (mergeK12Dp() * density.density).coerceAtLeast(0f)
+                val kAccPx = (mergeKAccDp() * density.density).coerceAtLeast(0f)
+                val effect = holder.buildRenderEffect(
+                    look = look,
+                    width = layerWidth.toFloat(),
+                    height = layerHeight.toFloat(),
+                    mergeK01 = k01Px,
+                    mergeK12 = k12Px,
+                    mergeKAcc = kAccPx,
+                ) ?: return@drawBehind
 
                 @Suppress("UNUSED_VARIABLE")
                 val tick = backdropState.drawTick
@@ -256,14 +271,25 @@ private class GlassGroupShaderHolder {
     private var lastLook: MorphGroupLook? = null
     private var lastWidth = -1f
     private var lastHeight = -1f
+    private var lastK01 = -1f
+    private var lastK12 = -1f
+    private var lastKAcc = -1f
     private var cachedEffect: AndroidRenderEffect? = null
 
-    fun buildRenderEffect(look: MorphGroupLook, width: Float, height: Float): AndroidRenderEffect? {
+    fun buildRenderEffect(
+        look: MorphGroupLook,
+        width: Float,
+        height: Float,
+        mergeK01: Float,
+        mergeK12: Float,
+        mergeKAcc: Float,
+    ): AndroidRenderEffect? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null
         val glass = glass ?: return null
         if (alphas.all { it <= 0.02f }) return null.also { cachedEffect = null; lastLook = null }
         val cached = cachedEffect
         if (cached != null && look === lastLook && width == lastWidth && height == lastHeight &&
+            mergeK01 == lastK01 && mergeK12 == lastK12 && mergeKAcc == lastKAcc &&
             shapes.contentEquals(lastShapes) && alphas.contentEquals(lastAlphas)
         ) {
             return cached
@@ -273,6 +299,10 @@ private class GlassGroupShaderHolder {
         lastLook = look
         lastWidth = width
         lastHeight = height
-        return glass.effect(shapes, alphas, width, height, look).also { cachedEffect = it }
+        lastK01 = mergeK01
+        lastK12 = mergeK12
+        lastKAcc = mergeKAcc
+        return glass.effect(shapes, alphas, width, height, look, mergeK01, mergeK12, mergeKAcc)
+            .also { cachedEffect = it }
     }
 }

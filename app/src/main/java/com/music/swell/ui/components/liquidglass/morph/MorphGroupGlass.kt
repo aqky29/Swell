@@ -36,6 +36,9 @@ internal class MorphGroupGlass {
     width: Float,
     height: Float,
     look: MorphGroupLook,
+    mergeK01: Float = look.mergeDistance,
+    mergeK12: Float = look.mergeDistance,
+    mergeKAcc: Float = look.mergeDistance,
   ): RenderEffect {
     val density = look.density
     val control = if (look.dark) MorphRecipe.ControlDark else MorphRecipe.ControlLight
@@ -44,7 +47,7 @@ internal class MorphGroupGlass {
       shader.setFloatUniform("shape$i", shapes[i * 4], shapes[i * 4 + 1], shapes[i * 4 + 2], shapes[i * 4 + 3])
     }
     shader.setFloatUniform("shapeAlpha", alphas[0], alphas[1], alphas[2], alphas[3])
-    shader.setFloatUniform("mergeDistance", look.mergeDistance)
+    shader.setFloatUniform("mergeDistances", mergeK01, mergeK12, mergeKAcc)
 
     shader.setFloatUniform("nodeOrigin", 0f, 0f)
     shader.setFloatUniform("sampleExtent", width, height)
