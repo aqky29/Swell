@@ -137,9 +137,9 @@ class VocalTracker(
     /**
      * Returns one vocal-presence value per STFT frame in [0, 1], or null when unavailable.
      *
-     * The model's input width is fixed at [FIXED_FRAMES] (~22.8 s), which was chosen upstream to
-     * cover a transition overlap plus padding. Shorter input is zero-padded; longer is refused
-     * rather than chunked, because a transition never needs more than one window.
+     * The patched dynamic-length graph (`[1, 2, bins, time]`) accepts any frame count up to
+     * [MAX_FRAMES] (~32.5 s), so short windows allocate and compute only their real length rather
+     * than zero-padding out to a fixed 960-frame tensor.
      */
     fun track(left: FloatArray, right: FloatArray, rate: Double): FloatArray? {
         if (!VocalSpectrogram.available) return null
@@ -148,25 +148,24 @@ class VocalTracker(
 
         val started = System.currentTimeMillis()
         val spectrogram = VocalSpectrogram.compute(resampledLeft, resampledRight) ?: return null
-        if (spectrogram.frames > FIXED_FRAMES) {
-            AnalysisLog.warn("Window of ${spectrogram.frames} frames exceeds the model's $FIXED_FRAMES")
+        val frames = spectrogram.frames
+        if (frames <= 0 || frames > MAX_FRAMES) {
+            AnalysisLog.warn("Window of $frames frames outside supported range 1..$MAX_FRAMES")
             return null
         }
         val active = session() ?: return null
 
         return runCatching {
             val bins = spectrogram.bins
-            // Direct, and sized for the model rather than for the input, so the
-            // ~16MB of mix never lands on the Java heap and ORT reads it where it
-            // lies instead of copying it into native memory. Both matter: this
-            // runs on devices whose whole Java heap is 256MB, and the two copies
-            // this replaces were together enough to end the process.
+            // Direct, sized to the actual window length rather than a fixed 960 frames: keeps the
+            // mix tensor off the Java heap and cuts both native RAM and LSTM inference cost
+            // proportionally on shorter windows.
             val backing = ByteBuffer
-                .allocateDirect(VocalSpectrogram.CHANNELS * bins * FIXED_FRAMES * Float.SIZE_BYTES)
+                .allocateDirect(VocalSpectrogram.CHANNELS * bins * frames * Float.SIZE_BYTES)
                 .order(ByteOrder.nativeOrder())
-            fillFixedFrames(backing.asFloatBuffer(), spectrogram.values, bins, spectrogram.frames)
+            backing.asFloatBuffer().put(spectrogram.values)
             val environment = OrtEnvironment.getEnvironment()
-            val shape = longArrayOf(1, VocalSpectrogram.CHANNELS.toLong(), bins.toLong(), FIXED_FRAMES.toLong())
+            val shape = longArrayOf(1, VocalSpectrogram.CHANNELS.toLong(), bins.toLong(), frames.toLong())
 
             // A fresh view per reader rather than rewinding one: FloatBuffer's own
             // rewind() and position(int) are Java 9 covariant overrides that
@@ -177,85 +176,19 @@ class VocalTracker(
             OnnxTensor.createTensor(environment, backing.asFloatBuffer(), shape).use { tensor ->
                 active.run(mapOf(active.inputNames.first() to tensor)).use { outputs ->
                     // The output tensor's buffer, not `outputs.get(0).value`: that
-                    // property boxes this [1, 2, bins, FIXED_FRAMES] result into
-                    // one FloatArray per bin per channel — 4098 objects and ~16MB
-                    // per call — when the only thing read from it is a band
-                    // average.
+                    // property boxes this [1, 2, bins, frames] result into
+                    // one FloatArray per bin per channel when the only thing read
+                    // from it is a band average.
                     val target = (outputs.get(0) as OnnxTensor).floatBuffer
-                    val curve = reduceToBandCurve(backing.asFloatBuffer(), target, bins, spectrogram.frames)
-                    AnalysisLog.warn("vocal mask ${spectrogram.frames} frames in " +
+                    val raw = reduceToBandCurve(backing.asFloatBuffer(), target, bins, frames)
+                    val curve = smoothVocalCurve(raw)
+                    AnalysisLog.warn("vocal mask $frames frames in " +
                             "${System.currentTimeMillis() - started}ms",
                     )
                     curve
                 }
             }
         }.onFailure { AnalysisLog.warn("Vocal inference failed", it) }.getOrNull()
-    }
-
-    /**
-     * Writes the spectrogram into the model's fixed width, zero-padding each bin's tail.
-     *
-     * The stride changes as well as the length: the source is stored at `frames` per bin and the
-     * model wants [FIXED_FRAMES], so this is a re-stride rather than an append.
-     *
-     * Sequential relative puts only. Seeking to each bin's start would be the obvious way to write
-     * it, but that needs `FloatBuffer.position(int)`, which Android declares on `Buffer` alone;
-     * writing the pad out explicitly keeps every call on a member that has existed since API 1.
-     */
-    private fun fillFixedFrames(into: FloatBuffer, values: FloatArray, bins: Int, frames: Int) {
-        if (frames == FIXED_FRAMES) {
-            into.put(values)
-            return
-        }
-        val pad = FloatArray(FIXED_FRAMES - frames)
-        for (channel in 0 until VocalSpectrogram.CHANNELS) {
-            for (bin in 0 until bins) {
-                into.put(values, (channel * bins + bin) * frames, frames)
-                into.put(pad)
-            }
-        }
-    }
-
-    /**
-     * Averages `mask = target / (mix + eps)` across a frequency band, then across channels.
-     *
-     * Band-averaging rather than a full per-bin mask: the only consumer is a single number per
-     * instant (how vocal this moment is), so per-bin resolution would be work with no reader.
-     * Only the frames carrying real audio are reduced; the padded tail's mask is meaningless and
-     * folding it in would drag every short window toward silence.
-     */
-    private fun reduceToBandCurve(
-        mix: FloatBuffer,
-        target: FloatBuffer,
-        bins: Int,
-        usableFrames: Int,
-    ): FloatArray {
-        val lowBin = floor(LOW_HZ * VocalSpectrogram.fftSize / VocalSpectrogram.sampleRate)
-            .toInt().coerceAtLeast(0)
-        val highBin = ceil(HIGH_HZ * VocalSpectrogram.fftSize / VocalSpectrogram.sampleRate)
-            .toInt().coerceAtMost(bins - 1)
-        if (highBin <= lowBin || usableFrames <= 0) return FloatArray(0)
-
-        val curve = FloatArray(usableFrames)
-        for (frame in 0 until usableFrames) {
-            var sum = 0.0
-            var count = 0
-            for (channel in 0 until VocalSpectrogram.CHANNELS) {
-                for (bin in lowBin..highBin) {
-                    // Both buffers carry the model's [1, 2, bins, FIXED_FRAMES]
-                    // layout, so one index reads the same cell of each. Absolute
-                    // get, so neither view's position matters.
-                    val index = (channel * bins + bin) * FIXED_FRAMES + frame
-                    val mixValue = mix.get(index)
-                    if (mixValue <= 1e-6f) continue
-                    val ratio = target.get(index) / mixValue
-                    sum += ratio.coerceIn(0f, 1f)
-                    count += 1
-                }
-            }
-            curve[frame] = if (count > 0) (sum / count).toFloat() else 0f
-        }
-        return curve
     }
 
     fun release() {
@@ -268,13 +201,120 @@ class VocalTracker(
 
     companion object {
         private const val TAG = "BitChordVocalTracker"
-        /** The weights this tracker needs, named once for every build that ships them. */
-        const val MODEL_ASSET = "vocals_umxhq_int8.onnx"
-        /** The model's fixed input width, ~22.8 s, chosen upstream to cover a transition overlap. */
+
+        /**
+         * Dynamic-length Open-Unmix vocals model (`[1, 2, 2049, time]`), patched from the fixed-960
+         * export with identical weights. A new name ensures existing installs unpack the dynamic
+         * graph instead of reusing the fixed-length copy in `filesDir`.
+         */
+        const val MODEL_ASSET = "vocals_umxhq_dyn_int8.onnx"
+
+        /** Retired fixed-length unpacked model deleted from app storage on first use. */
+        const val RETIRED_MODEL_ASSET = "vocals_umxhq_int8.onnx"
+
+        /** Upper bound on frames per single pass (~32.5 s) to keep DirectByteBuffer RAM bounded. */
+        const val MAX_FRAMES = 1400
+
+        /** Legacy fixed frame count kept for reference. */
         const val FIXED_FRAMES = 960
 
         /** The band a vocal actually occupies; below and above it the mask says little. */
-        private const val LOW_HZ = 200.0
-        private const val HIGH_HZ = 4000.0
+        const val LOW_HZ = 200.0
+        const val HIGH_HZ = 4000.0
+
+        /**
+         * Computes the magnitude-weighted vocal share across [LOW_HZ]..[HIGH_HZ] and both channels:
+         * `sum(min(target, mix)) / sum(mix)`.
+         *
+         * Weighting by bin magnitude prevents quiet noise bins from inflating the score on pure
+         * instrumentals while keeping the output naturally calibrated on `[0, 1]`.
+         */
+        fun reduceToBandCurve(
+            mix: FloatBuffer,
+            target: FloatBuffer,
+            bins: Int,
+            frames: Int,
+            fftSize: Int = VocalSpectrogram.fftSize,
+            sampleRate: Double = VocalSpectrogram.sampleRate,
+        ): FloatArray {
+            val lowBin = floor(LOW_HZ * fftSize / sampleRate)
+                .toInt().coerceAtLeast(0)
+            val highBin = ceil(HIGH_HZ * fftSize / sampleRate)
+                .toInt().coerceAtMost(bins - 1)
+            if (highBin <= lowBin || frames <= 0) return FloatArray(0)
+
+            val curve = FloatArray(frames)
+            for (frame in 0 until frames) {
+                var targetSum = 0.0
+                var mixSum = 0.0
+                for (channel in 0 until VocalSpectrogram.CHANNELS) {
+                    for (bin in lowBin..highBin) {
+                        // Both buffers carry the model's [1, 2, bins, frames]
+                        // layout, so one index reads the same cell of each. Absolute
+                        // get, so neither view's position matters.
+                        val index = (channel * bins + bin) * frames + frame
+                        val mixValue = mix.get(index).toDouble()
+                        if (mixValue <= 1e-6) continue
+                        val targetValue = target.get(index).toDouble().coerceIn(0.0, mixValue)
+                        targetSum += targetValue
+                        mixSum += mixValue
+                    }
+                }
+                curve[frame] = if (mixSum > 1e-6) (targetSum / mixSum).toFloat().coerceIn(0f, 1f) else 0f
+            }
+            return curve
+        }
+
+        /**
+         * 3-frame (~70 ms) median filter that removes isolated single-frame percussive spikes
+         * (snare/clap transients) without smearing vocal onsets or offsets.
+         */
+        fun smoothVocalCurve(raw: FloatArray): FloatArray {
+            if (raw.size < 3) return raw.copyOf()
+            val out = FloatArray(raw.size)
+            out[0] = raw[0]
+            out[raw.lastIndex] = raw[raw.lastIndex]
+            for (i in 1 until raw.lastIndex) {
+                val a = raw[i - 1]
+                val b = raw[i]
+                val c = raw[i + 1]
+                out[i] = maxOf(minOf(a, b), minOf(maxOf(a, b), c))
+            }
+            return out
+        }
+
+        /**
+         * True when [spans] came from word-synced or explicitly end-timed lyrics (every span's
+         * [LoopMix.Span.certainUntil] covers its full end), so no open-line tail needs the vocal
+         * ONNX model to vouch for it.
+         */
+        fun hasExactLyrics(spans: List<LoopMix.Span>): Boolean =
+            spans.size >= 4 && spans.all { it.end > it.start && it.certainUntil >= it.end - 1e-3 }
+
+        /**
+         * Synthesizes a vocal-presence curve over `[startSeconds, startSeconds + durationSeconds)`
+         * from exact sung lyric [spans], matching the scale of [reduceToBandCurve] (`0.85` while
+         * singing, `0.02` during instrumental stretches).
+         */
+        fun vocalCurveFromLyrics(
+            spans: List<LoopMix.Span>,
+            startSeconds: Double,
+            durationSeconds: Double,
+            frameRate: Double = VocalSpectrogram.frameRate,
+        ): FloatArray {
+            val frames = (durationSeconds * frameRate).toInt()
+            if (frames <= 0 || frameRate <= 0.0) return FloatArray(0)
+            val curve = FloatArray(frames) { 0.02f }
+            val endSeconds = startSeconds + durationSeconds
+            for (span in spans) {
+                if (span.end <= startSeconds || span.start >= endSeconds) continue
+                val from = floor((span.start - startSeconds) * frameRate).toInt().coerceIn(0, frames - 1)
+                val to = ceil((span.end - startSeconds) * frameRate).toInt().coerceIn(from + 1, frames)
+                for (f in from until to) {
+                    curve[f] = 0.85f
+                }
+            }
+            return curve
+        }
     }
 }

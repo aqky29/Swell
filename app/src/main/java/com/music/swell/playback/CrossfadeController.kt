@@ -220,6 +220,8 @@ class CrossfadeController(
     private val loopRegion: (MediaItem, Long, Double, Double, Int) -> LoopRegion? = { _, _, _, _, _ -> null },
     /** A track's synced lyrics, for vouching a loop instrumental; null when it has none. */
     private val syncedLines: suspend (MediaItem, Long) -> List<LyricLine>? = { _, _ -> null },
+    /** Notifies the analyzer when word-synced / end-timed lyrics can replace vocal ONNX inference. */
+    private val onExactLyrics: (String, List<LoopMix.Span>) -> Unit = { _, _ -> },
     /** The loudness-normalisation gain a track plays at, so the incoming deck is levelled like its player. */
     private val loudnessGain: (String) -> Float = { 1f },
     /** The session's playhead moved on purpose during a loop mix: a loop wrap (true) or a re-anchor (false). */
@@ -1261,8 +1263,11 @@ class CrossfadeController(
         if (nextIndex == C.INDEX_UNSET) return
         val nextItem = player.getMediaItemAt(nextIndex)
         if (currentItem.isVideoOrigin || nextItem.isVideoOrigin) return
+        val nextDuration = nextItemDurationMs(nextIndex, nextItem)
+        askLyrics(currentItem, duration)
+        askLyrics(nextItem, nextDuration)
         requestAnalysis(currentItem, duration)
-        requestAnalysis(nextItem, nextItemDurationMs(nextIndex, nextItem))
+        requestAnalysis(nextItem, nextDuration)
     }
 
     /**
@@ -2394,6 +2399,9 @@ class CrossfadeController(
                 )
             }
             lyricSpans[id] = LyricSpans(spans)
+            if (spans != null) {
+                onExactLyrics(id, spans)
+            }
         }
     }
 
@@ -3069,6 +3077,16 @@ class CrossfadeController(
             if (handedOff) filters.outgoing(lowPassHz, highPassHz) else filters.incoming(lowPassHz, highPassHz)
         }
 
+        override fun incomingMidDuck(db: Float) {
+            if (!aimIncoming) return
+            if (handedOff) filters.incomingMidDuck(db) else filters.outgoingMidDuck(db)
+        }
+
+        override fun outgoingMidDuck(db: Float) {
+            if (!aimOutgoing) return
+            if (handedOff) filters.outgoingMidDuck(db) else filters.incomingMidDuck(db)
+        }
+
         override fun incomingLeadMs(): Long =
             if (handedOff) filters.incomingLeadMs() else filters.outgoingLeadMs()
 
@@ -3234,10 +3252,12 @@ class CrossfadeController(
             glide(open, floor, progress.toDouble().pow(FILTER_SWEEP_SHAPE)).toFloat(),
             TransitionFilterProcessor.OFF_HZ,
         )
+        tracks.outgoingMidDuck((-VOCAL_MID_DUCK_DB * amount * progress).toFloat())
         tracks.incoming(
             TransitionFilterProcessor.OPEN_HZ,
             entryHighPass(progress, amount, VOCAL_SEPARATION_HIGH_PASS_HZ, ENTRY_OPEN_BY),
         )
+        tracks.incomingMidDuck(0f)
     }
 
     /**
@@ -3410,7 +3430,9 @@ class CrossfadeController(
             ),
         )
         tracks.incoming(TransitionFilterProcessor.OPEN_HZ, entry)
+        tracks.incomingMidDuck(0f)
         tracks.outgoing(blendExitLowPass(progress, clash), bassCutoff(handover))
+        tracks.outgoingMidDuck((-VOCAL_MID_DUCK_DB * clash * progress).toFloat())
     }
 
     /**
@@ -4130,6 +4152,9 @@ class CrossfadeController(
          * above enough of its body that the track still reads as itself.
          */
         const val VOCAL_SEPARATION_FLOOR_HZ = 1_600.0
+
+        /** Maximum outgoing vocal-band (1.4 kHz peaking EQ) attenuation in dB during a vocal clash. */
+        const val VOCAL_MID_DUCK_DB = 5.5
 
         /**
          * Where the incoming track's high-pass starts in [rideVocalSeparation].

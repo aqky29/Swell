@@ -333,8 +333,10 @@ class AnalysisStore(
          *
          * 4: the beat model was replaced. beat_this_int8 found no beats, so every
          * schema-3 grid is the DSP fallback and has to be re-earned.
+         * 5: Beat This! small0 + bar-consistency downbeat regularization +
+         * dynamic energy-weighted vocal curve (and word-synced lyric bypass).
          */
-        const val SCHEMA_VERSION = 4
+        const val SCHEMA_VERSION = 5
 
         /** A few thousand tracks' worth, at tens of kilobytes each. */
         const val MAX_ENTRIES = 2_000

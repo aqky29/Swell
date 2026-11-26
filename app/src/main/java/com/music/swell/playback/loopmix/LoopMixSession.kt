@@ -220,6 +220,16 @@ class LoopMixSession private constructor(
                 floatArrayOf(LoopMix.HIGH_PASS_FROM_HZ.toFloat(), LoopMix.HIGH_PASS_TO_HZ.toFloat()),
                 exponential = true,
             )
+            // Harmonic micro pitch-shift (±1 st): hold the incoming loop in key while blending
+            // over the outgoing track, then ease smoothly back to 0 st across the tempo ramp so
+            // it arrives at its natural key before release & player handover.
+            if (plan.inPitchSemitones != 0f) {
+                renderer.setEnvelope(
+                    LoopMixRenderer.IN, LoopMixRenderer.KIND_PITCH_SEMITONES,
+                    doubleArrayOf(0.0, clock.enterEnd, clock.rampEnd),
+                    floatArrayOf(plan.inPitchSemitones, plan.inPitchSemitones, 0f),
+                )
+            }
             renderer.prepare()
             // The incoming deck hands over to its own player at the same track position.
             renderer.setFadeOut(LoopMixRenderer.IN, clock.elementTrackTime)

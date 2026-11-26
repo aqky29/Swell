@@ -142,6 +142,12 @@ object LoopMix {
         val exitBars: Int,
         /** Outgoing bars from the outgoing loop's start to the incoming loop's release. */
         val totalBars: Int,
+        /**
+         * Signed micro pitch shift (in semitones, at most ±1) applied to the incoming loop during
+         * entry to resolve harmonic key clashes (minor-2nd / tritone / third clashes) onto a
+         * Camelot-compatible scale before easing smoothly back to 0 during the ramp.
+         */
+        val inPitchSemitones: Float = 0f,
     ) {
         /** The tempo the ramp arrives at, in outgoing beats per minute. */
         val targetBpm: Double get() = inn.bpm / fold
@@ -229,7 +235,56 @@ object LoopMix {
             rampBars = rampBars,
             exitBars = totalBars - ENTER_BARS - rampBars,
             totalBars = totalBars,
+            inPitchSemitones = harmonicPitchShift(out, inn),
         )
+    }
+
+    /**
+     * Computes a transparent micro pitch shift (0, +1, or -1 semitone) for the incoming loop so
+     * that harsh key clashes (minor second, tritone, major third / minor sixth) snap onto a
+     * Camelot-compatible scale (same relative major or ±fifth) during the overlap.
+     *
+     * Returns `0f` whenever either track lacks a trusted key (`keyConfidence < 0.25`) or the pair
+     * is already harmonically compatible.
+     */
+    fun harmonicPitchShift(out: TrackAnalysis, inn: TrackAnalysis): Float {
+        if (out.keyConfidence < MIN_KEY_CONFIDENCE || inn.keyConfidence < MIN_KEY_CONFIDENCE) return 0f
+        val outMajor = relativeMajorPitchClass(out.key) ?: return 0f
+        val inMajor = relativeMajorPitchClass(inn.key) ?: return 0f
+        val diff = (inMajor - outMajor + 12) % 12
+        return when (diff) {
+            1 -> -1f   // incoming +1 st above outgoing -> shift down 1 st to exact unison/relative scale
+            11 -> +1f  // incoming -1 st below outgoing -> shift up 1 st to exact unison/relative scale
+            6 -> -1f   // tritone clash -> shift down 1 st to perfect fourth (adjacent Camelot)
+            4 -> +1f   // major third clash -> shift up 1 st to perfect fourth (adjacent Camelot)
+            8 -> -1f   // minor sixth clash -> shift down 1 st to perfect fifth (adjacent Camelot)
+            else -> 0f // 0, 5, 7 already Camelot-compatible; 2, 10 energy-boost; 3, 9 mild
+        }
+    }
+
+    private const val MIN_KEY_CONFIDENCE = 0.25
+
+    private val PITCH_CLASS = mapOf(
+        "C" to 0, "B#" to 0,
+        "C#" to 1, "Db" to 1,
+        "D" to 2,
+        "D#" to 3, "Eb" to 3,
+        "E" to 4, "Fb" to 4,
+        "F" to 5, "E#" to 5,
+        "F#" to 6, "Gb" to 6,
+        "G" to 7,
+        "G#" to 8, "Ab" to 8,
+        "A" to 9,
+        "A#" to 10, "Bb" to 10,
+        "B" to 11, "Cb" to 11,
+    )
+
+    /** Maps e.g. "C major" -> 0, "A minor" -> 0 (its relative major tonic, sharing the exact same scale). */
+    private fun relativeMajorPitchClass(key: String): Int? {
+        val parts = key.trim().split(' ')
+        val root = PITCH_CLASS[parts.firstOrNull()] ?: return null
+        val mode = parts.getOrNull(1)?.lowercase()
+        return if (mode == "minor" || mode == "min" || mode == "m") (root + 3) % 12 else root
     }
 
     /** The fallback constant grid: a beat length, and a bar line to count from. */

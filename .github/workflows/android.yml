@@ -4,6 +4,15 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      abi:
+        description: 'Target ABI (arm64-v8a for single ABI, or all for all ABIs + universal)'
+        required: false
+        default: 'arm64-v8a'
+        type: choice
+        options:
+          - arm64-v8a
+          - all
 
 jobs:
   build-prod-release:
@@ -18,38 +27,61 @@ jobs:
       with:
         java-version: '17'
         distribution: 'temurin'
-        cache: gradle
+
+    - uses: gradle/actions/setup-gradle@v4
 
     - name: Setup Secrets (Keystore & local.properties)
+      env:
+        LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+        LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+        KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
       run: |
-        echo "LASTFM_API_KEY=${{ secrets.LASTFM_API_KEY }}" > local.properties
-        echo "LASTFM_SECRET=${{ secrets.LASTFM_SECRET }}" >> local.properties
+        echo "LASTFM_API_KEY=${LASTFM_API_KEY}" > local.properties
+        echo "LASTFM_SECRET=${LASTFM_SECRET}" >> local.properties
 
-        echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > bitchord-release.jks
-        {
-          echo "storeFile=bitchord-release.jks"
-          echo "storePassword=${{ secrets.KEYSTORE_PASSWORD }}"
-          echo "keyAlias=${{ secrets.KEY_ALIAS }}"
-          echo "keyPassword=${{ secrets.KEY_PASSWORD }}"
-        } > keystore.properties
+        if [ -n "${KEYSTORE_BASE64}" ]; then
+          echo "${KEYSTORE_BASE64}" | base64 -d > swell-release.jks
+          {
+            echo "storeFile=swell-release.jks"
+            echo "storePassword=${KEYSTORE_PASSWORD}"
+            echo "keyAlias=${KEY_ALIAS}"
+            echo "keyPassword=${KEY_PASSWORD}"
+          } > keystore.properties
+          echo "Release keystore configured."
+        else
+          echo "No KEYSTORE_BASE64 secret set; falling back to debug signing key."
+        fi
 
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
 
-    - name: Build Signed Prod Release APK
-      run: ./gradlew assembleProdRelease
+    - name: Accept Android SDK licenses
+      run: yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
-    - name: Upload APK Artifact
+    - name: Build Prod Release APK
+      env:
+        TARGET_ABI: ${{ inputs.abi || 'arm64-v8a' }}
+      run: |
+        HEAP_FLAGS=(-Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" -Pkotlin.daemon.jvmargs="-Xmx4g")
+        if [ "${TARGET_ABI}" = "all" ]; then
+          ./gradlew "${HEAP_FLAGS[@]}" :app:assembleProdRelease :wearos:assembleProdRelease
+        else
+          ./gradlew "${HEAP_FLAGS[@]}" :app:assembleProdRelease -Pswell.abi="${TARGET_ABI}"
+        fi
+        ls -lh app/build/outputs/apk/prod/release/*.apk
+
+    - name: Upload Phone Release APK Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: bitchord-prod-release-signed
+        name: swell-prod-release-${{ inputs.abi || 'arm64-v8a' }}
         path: app/build/outputs/apk/prod/release/*.apk
 
-    # Built by the same assembleProdRelease, with the same key. The watch app
-    # only pairs with a phone app signed by the same key, so a prod watch APK
-    # for these phone builds can only come from here, never a local build.
     - name: Upload Wear OS APK Artifact
+      if: ${{ (inputs.abi || 'arm64-v8a') == 'all' }}
       uses: actions/upload-artifact@v4
       with:
-        name: bitchord-wear-prod-release-signed
+        name: swell-wear-prod-release
         path: wearos/build/outputs/apk/prod/release/*.apk

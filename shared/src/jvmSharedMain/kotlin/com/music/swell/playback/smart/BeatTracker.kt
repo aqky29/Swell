@@ -127,30 +127,40 @@ class BeatTracker(
 
         val fps = MelSpectrogram.frameRate
         val beatFrames = pickPeaks(beatLogits)
-        val beats = beatFrames.map { it / fps + offsetSeconds }
-        if (beats.size < MIN_BEATS) return null
+        val rawBeats = beatFrames.map { it / fps + offsetSeconds }
+        if (rawBeats.size < MIN_BEATS) return null
 
-        val bpm = tempoFromBeats(beats)
+        val bpm = tempoFromBeats(rawBeats)
         if (bpm <= 0) return null
+        val beatInterval = 60 / bpm
+
+        val beats = regularizeBeats(rawBeats, beatInterval)
 
         // Every downbeat is a beat. The two heads are predicted independently, so their peaks can
         // land a frame apart; snapping each downbeat onto the nearest beat keeps the bar grid a
         // strict subset of the beat grid, which is what the planner assumes when it snaps a
         // transition to a downbeat.
-        val downbeats = pickPeaks(downbeatLogits)
+        val rawDownbeats = pickPeaks(downbeatLogits)
             .map { it / fps + offsetSeconds }
             .map { time -> beats.minByOrNull { abs(it - time) } ?: beats.first() }
             .distinct()
             .sorted()
+        val downbeats = regularizeDownbeats(
+            beats = beats,
+            downbeatLogits = downbeatLogits,
+            rawDownbeats = rawDownbeats,
+            fps = fps,
+            offsetSeconds = offsetSeconds,
+        )
 
         return Grid(
             beats = beats,
             downbeats = downbeats,
             bpm = bpm,
-            beatInterval = 60 / bpm,
+            beatInterval = beatInterval,
             firstBeat = beats.first(),
             beatConfidence = gridConfidence(
-                beats,
+                rawBeats,
                 beatFrames.map { frame -> beatLogits.getOrElse(frame.roundToInt()) { 0f }.toDouble() },
             ),
         )
@@ -219,16 +229,17 @@ class BeatTracker(
         /**
          * The weights this tracker needs, named once for every build that ships them.
          *
-         * The official final0 checkpoint with only its MatMuls quantized (int8, per channel); the
-         * convolutions stay float. The earlier `beat_this_int8.onnx` quantized the convolutions
-         * too and found no beats at all, so every grid fell back to the DSP estimate. A new name
-         * rather than the old one because the app unpacks assets once by name and would keep
-         * serving the stale copy.
+         * The official Beat This! `small0` checkpoint (~2M params, MIT) with only its MatMuls
+         * quantized (int8, per channel) and convolutions kept float, exported without cached RoPE
+         * tables (~3.5 MB vs 23.1 MB for `final0`, ~1.6x faster on CPU, within 0.3 F1 on beats).
+         * The earlier `beat_this_int8.onnx` quantized convolutions too and found no beats at all.
+         * A new name rather than reusing the old one ensures existing installs unpack the new file.
          */
-        const val MODEL_ASSET = "beat_this_final0_q8.onnx"
+        const val MODEL_ASSET = "beat_this_small0_q8.onnx"
 
-        /** The broken earlier export, whose unpacked copy is deleted on first use of the new one. */
+        /** Retired unpacked models deleted from app storage on first use of [MODEL_ASSET]. */
         const val RETIRED_MODEL_ASSET = "beat_this_int8.onnx"
+        val RETIRED_MODEL_ASSETS = listOf("beat_this_int8.onnx", "beat_this_final0_q8.onnx")
         /** The window the model was trained on, and the margin discarded from each chunk's edges. */
         const val CHUNK_FRAMES = 1500
         const val BORDER_FRAMES = 6
@@ -336,6 +347,112 @@ class BeatTracker(
             // Logits are unbounded; a median around 2 is a decisive peak, around 0 is not.
             val strength = 1 / (1 + exp(-(median(peakLogits) - 0.5)))
             return max(0.0, min(0.95, 0.35 + 0.4 * regular + 0.25 * strength))
+        }
+
+        /**
+         * Fills short drumless holes (1–3 missed beats) where a gap between consecutive detected
+         * beats matches an integer multiple of [beatInterval] within ±12%. Longer silences or
+         * irregular tempo shifts are left untouched.
+         */
+        fun regularizeBeats(beats: List<Double>, beatInterval: Double): List<Double> {
+            if (beats.size < 2 || beatInterval <= 0.0) return beats
+            val result = ArrayList<Double>(beats.size + 8)
+            result += beats.first()
+            for (i in 0 until beats.size - 1) {
+                val start = beats[i]
+                val end = beats[i + 1]
+                val gap = end - start
+                val multiples = (gap / beatInterval).roundToInt()
+                if (multiples in 2..4 && abs(gap - multiples * beatInterval) <= beatInterval * 0.12) {
+                    val step = gap / multiples
+                    for (k in 1 until multiples) {
+                        result += start + k * step
+                    }
+                }
+                result += end
+            }
+            return result
+        }
+
+        /**
+         * Locks downbeats onto the most consistent periodic bar phase (4/4 or 3/4) supported by
+         * [downbeatLogits] across [beats], eliminating isolated dropped or off-beat downbeat peaks
+         * during thin bars and breakdowns.
+         *
+         * Falls back to [rawDownbeats] whenever the beat grid itself is irregular or neither 4/4
+         * nor 3/4 shows strong phase contrast (preserving 5/4, 7/8, or rubato pieces).
+         */
+        fun regularizeDownbeats(
+            beats: List<Double>,
+            downbeatLogits: FloatArray,
+            rawDownbeats: List<Double>,
+            fps: Double,
+            offsetSeconds: Double = 0.0,
+        ): List<Double> {
+            if (beats.size < MIN_BEATS || downbeatLogits.isEmpty() || fps <= 0.0) return rawDownbeats
+            val gaps = beats.zipWithNext { left, right -> right - left }
+            val interval = median(gaps)
+            if (interval <= 0.0) return rawDownbeats
+            val regularShare = gaps.count { abs(it - interval) <= interval * 0.15 }.toDouble() / gaps.size
+            if (regularShare < 0.75) return rawDownbeats
+
+            // Peak downbeat probability around each beat (±2 frames ≈ ±40 ms).
+            val beatProbs = DoubleArray(beats.size) { i ->
+                val center = ((beats[i] - offsetSeconds) * fps).roundToInt()
+                val lo = max(0, center - 2)
+                val hi = min(downbeatLogits.size - 1, center + 2)
+                if (lo > hi) {
+                    0.0
+                } else {
+                    var bestLogit = Float.NEGATIVE_INFINITY
+                    for (f in lo..hi) {
+                        if (downbeatLogits[f] > bestLogit) bestLogit = downbeatLogits[f]
+                    }
+                    1.0 / (1.0 + exp(-bestLogit.toDouble()))
+                }
+            }
+
+            var bestMeter = 0
+            var bestPhase = 0
+            var bestRanked = Double.NEGATIVE_INFINITY
+            var bestContrast = 0.0
+            var bestOnMean = 0.0
+
+            for (meter in intArrayOf(4, 3)) {
+                val prior = if (meter == 4) 0.03 else 0.0
+                for (phase in 0 until meter) {
+                    var onSum = 0.0
+                    var onCount = 0
+                    var offSum = 0.0
+                    var offCount = 0
+                    for (i in beatProbs.indices) {
+                        if (i % meter == phase) {
+                            onSum += beatProbs[i]
+                            onCount += 1
+                        } else {
+                            offSum += beatProbs[i]
+                            offCount += 1
+                        }
+                    }
+                    if (onCount < 2 || offCount == 0) continue
+                    val onMean = onSum / onCount
+                    val offMean = offSum / offCount
+                    val contrast = onMean - offMean
+                    val ranked = contrast + prior
+                    if (ranked > bestRanked) {
+                        bestRanked = ranked
+                        bestMeter = meter
+                        bestPhase = phase
+                        bestContrast = contrast
+                        bestOnMean = onMean
+                    }
+                }
+            }
+
+            if (bestMeter == 0 || bestContrast < 0.20 || bestOnMean < 0.35) return rawDownbeats
+            return beats.indices
+                .filter { it % bestMeter == bestPhase }
+                .map { beats[it] }
         }
     }
 }
