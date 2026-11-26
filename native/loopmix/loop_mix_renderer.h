@@ -76,6 +76,8 @@ struct Deck {
   Envelope gain;
   Envelope lowDb;
   Envelope highPassHz;
+  /** Optional micro pitch shift in semitones (e.g. ±1 st harmonic rescue during overlap, easing to 0). */
+  Envelope pitchSemitones;
 
   /** Unwrapped region-sample position at which the deck fades out over [fadeSamples]; negative = never. */
   std::atomic<double> fadeOutAt{-1.0};
@@ -93,6 +95,7 @@ struct Deck {
   Biquad highPass;
   float shelfDb = 0;
   float highPassFreq = 0;
+  float lastPitchSemitones = 0;
 
   /** Track seconds an unwrapped position plays (continuous; the loop and its release applied). */
   double trackSecondsAt(double unwrapped, double sampleRate) const;

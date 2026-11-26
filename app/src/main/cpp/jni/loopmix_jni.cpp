@@ -71,7 +71,11 @@ Java_com_music_swell_playback_loopmix_LoopMixRenderer_nativeSetEnvelope(
     jboolean exponential) {
   Deck* deck = DeckOf(handle, index);
   if (deck == nullptr) return;
-  Envelope* envelope = kind == 0 ? &deck->gain : kind == 1 ? &deck->lowDb : kind == 2 ? &deck->highPassHz : nullptr;
+  Envelope* envelope = kind == 0 ? &deck->gain
+      : kind == 1 ? &deck->lowDb
+      : kind == 2 ? &deck->highPassHz
+      : kind == 3 ? &deck->pitchSemitones
+      : nullptr;
   if (envelope == nullptr) return;
   const jsize points = std::min(env->GetArrayLength(times), env->GetArrayLength(values));
   envelope->times.resize(points);

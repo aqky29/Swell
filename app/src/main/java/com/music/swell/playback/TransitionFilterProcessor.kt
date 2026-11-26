@@ -9,20 +9,25 @@ import com.music.swell.playback.audio.AudioBlock
 import com.music.swell.playback.audio.FloatAudioProcessor
 import com.music.swell.playback.audio.PcmBoundary
 import java.nio.ByteOrder
+import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.min
+import kotlin.math.pow
+import kotlin.math.sin
 import kotlin.math.tan
 
 /**
  * The filter a track rides through a Automix transition: a low-pass that can
- * close over the outgoing track, and a high-pass that can lift the low end out
- * of one side of a blend.
+ * close over the outgoing track, a high-pass that can lift the low end out
+ * of one side of a blend, and an optional mid-band vocal ducking notch
+ * (centered at 1.4 kHz, Q = 0.7) to carve a pocket when two vocals overlap.
  *
  * ## The filter
  *
  * A topology-preserving (trapezoidal-integrator) state-variable filter, two
- * second-order sections cascaded to a 24 dB/octave Butterworth response.
+ * second-order sections cascaded to a 24 dB/octave Butterworth response,
+ * followed by an RBJ peaking biquad when mid-band vocal ducking is active.
  */
 @UnstableApi
 class TransitionFilterProcessor : BaseAudioProcessor() {
@@ -33,15 +38,22 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
     @Volatile
     private var targetHighPassHz: Float = OFF_HZ
 
+    /** Target vocal-band attenuation in dB (0f = off, negative = ducking up to [MAX_MID_DUCK_DB]). */
+    @Volatile
+    private var targetMidDuckDb: Float = 0f
+
     private var channelCount = 0
     private var sampleRate = 0
 
     private var currentLowPassHz = OPEN_HZ
     private var currentHighPassHz = OFF_HZ
+    private var currentMidDuckDb = 0f
 
     /** Two integrator states per second-order section, per channel. */
     private var lowState = FloatArray(0)
     private var highState = FloatArray(0)
+    /** Two Direct Form II Transposed states per channel for the vocal-band peaking EQ. */
+    private var midState = FloatArray(0)
 
     private val lowA1 = FloatArray(STAGES)
     private val lowA2 = FloatArray(STAGES)
@@ -50,6 +62,12 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
     private val highA2 = FloatArray(STAGES)
     private val highA3 = FloatArray(STAGES)
     private val highK = FloatArray(STAGES)
+
+    private var midB0 = 1f
+    private var midB1 = 0f
+    private var midB2 = 0f
+    private var midA1 = 0f
+    private var midA2 = 0f
 
     /** Whether the integrators hold anything since they were last cleared. */
     private var filterStateDirty = false
@@ -120,12 +138,25 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         targetHighPassHz = highPassHz.coerceIn(OFF_HZ, MAX_HIGH_PASS_HZ)
     }
 
-    /** Parks both filters. Glided, not snapped. */
-    fun open() = setCutoffs(OPEN_HZ, OFF_HZ)
+    /**
+     * Carves a gentle vocal-band notch (centered at [VOCAL_DUCK_CENTER_HZ], Q = [VOCAL_DUCK_Q])
+     * when two vocals overlap. `0f` turns it off; negative values attenuate down to [MAX_MID_DUCK_DB].
+     */
+    fun setMidDuckDb(db: Float) {
+        targetMidDuckDb = db.coerceIn(MAX_MID_DUCK_DB, 0f)
+    }
+
+    /** Parks all filters. Glided, not snapped. */
+    fun open() {
+        setCutoffs(OPEN_HZ, OFF_HZ)
+        setMidDuckDb(0f)
+    }
 
     val isFiltering: Boolean
         get() = targetLowPassHz < OPEN_HZ || targetHighPassHz > OFF_HZ ||
-            currentLowPassHz < OPEN_HZ - SETTLED_HZ || currentHighPassHz > OFF_HZ + SETTLED_HZ
+            targetMidDuckDb < -SETTLED_DB ||
+            currentLowPassHz < OPEN_HZ - SETTLED_HZ || currentHighPassHz > OFF_HZ + SETTLED_HZ ||
+            currentMidDuckDb < -SETTLED_DB
 
     /**
      * Engages the echo out, or moves it: [delaySeconds] between repeats, [send]
@@ -172,8 +203,13 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
             lowState = FloatArray(requiredSize)
             highState = FloatArray(requiredSize)
         }
+        val midSize = channelCount * 2
+        if (midState.size != midSize) {
+            midState = FloatArray(midSize)
+        }
         currentLowPassHz = targetLowPassHz
         currentHighPassHz = targetHighPassHz
+        currentMidDuckDb = targetMidDuckDb
         if (echoLow.size != channelCount) {
             echoLow = FloatArray(channelCount)
             echoHigh = FloatArray(channelCount)
@@ -200,8 +236,10 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
     private fun filter(block: AudioBlock, frameCount: Int) {
         val targetLow = targetLowPassHz
         val targetHigh = targetHighPassHz
-        val parked = targetLow >= OPEN_HZ && targetHigh <= OFF_HZ &&
-            currentLowPassHz >= OPEN_HZ - SETTLED_HZ && currentHighPassHz <= OFF_HZ + SETTLED_HZ
+        val targetMid = targetMidDuckDb
+        val parked = targetLow >= OPEN_HZ && targetHigh <= OFF_HZ && targetMid >= -SETTLED_DB &&
+            currentLowPassHz >= OPEN_HZ - SETTLED_HZ && currentHighPassHz <= OFF_HZ + SETTLED_HZ &&
+            currentMidDuckDb >= -SETTLED_DB
         if (parked) {
             clearStateIfNeeded()
             return
@@ -214,10 +252,13 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
             val subBlock = min(remaining, GLIDE_FRAMES)
             currentLowPassHz = glide(currentLowPassHz, targetLow)
             currentHighPassHz = glide(currentHighPassHz, targetHigh)
+            currentMidDuckDb += (targetMid - currentMidDuckDb) * GLIDE_RATE
             val lowOn = currentLowPassHz < OPEN_HZ - SETTLED_HZ
             val highOn = currentHighPassHz > OFF_HZ + SETTLED_HZ
+            val midOn = currentMidDuckDb < -SETTLED_DB
             if (lowOn) updateLowCoefficients()
             if (highOn) updateHighCoefficients()
+            if (midOn) updateMidCoefficients()
 
             for (f in 0 until subBlock) {
                 val baseIdx = (frameOffset + f) * channelCount
@@ -225,6 +266,7 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
                     var sample = block.samples[baseIdx + channel]
                     if (lowOn) sample = lowPass(channel, sample)
                     if (highOn) sample = highPass(channel, sample)
+                    if (midOn) sample = midDuck(channel, sample)
                     // Headroom preserved: no clamping to [-1.0f, +1.0f]
                     block.samples[baseIdx + channel] = sample
                 }
@@ -253,8 +295,10 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
     override fun onFlush() {
         lowState.fill(0f)
         highState.fill(0f)
+        midState.fill(0f)
         currentLowPassHz = targetLowPassHz
         currentHighPassHz = targetHighPassHz
+        currentMidDuckDb = targetMidDuckDb
         // Whatever the ring holds is from before the seek; start it clean.
         echoSeenGeneration = echoGeneration - 1
     }
@@ -264,8 +308,11 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         echoSeenGeneration = echoGeneration - 1
         targetLowPassHz = OPEN_HZ
         targetHighPassHz = OFF_HZ
+        targetMidDuckDb = 0f
+        currentMidDuckDb = 0f
         lowState = FloatArray(0)
         highState = FloatArray(0)
+        midState = FloatArray(0)
         channelCount = 0
         sampleRate = 0
     }
@@ -279,8 +326,10 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
 
         val targetLow = targetLowPassHz
         val targetHigh = targetHighPassHz
-        val parked = targetLow >= OPEN_HZ && targetHigh <= OFF_HZ &&
-            currentLowPassHz >= OPEN_HZ - SETTLED_HZ && currentHighPassHz <= OFF_HZ + SETTLED_HZ
+        val targetMid = targetMidDuckDb
+        val parked = targetLow >= OPEN_HZ && targetHigh <= OFF_HZ && targetMid >= -SETTLED_DB &&
+            currentLowPassHz >= OPEN_HZ - SETTLED_HZ && currentHighPassHz <= OFF_HZ + SETTLED_HZ &&
+            currentMidDuckDb >= -SETTLED_DB
         if (parked) {
             clearStateIfNeeded()
             outputBuffer.put(inputBuffer)
@@ -298,16 +347,20 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
             val subBlock = min(remaining, GLIDE_FRAMES)
             currentLowPassHz = glide(currentLowPassHz, targetLow)
             currentHighPassHz = glide(currentHighPassHz, targetHigh)
+            currentMidDuckDb += (targetMid - currentMidDuckDb) * GLIDE_RATE
             val lowOn = currentLowPassHz < OPEN_HZ - SETTLED_HZ
             val highOn = currentHighPassHz > OFF_HZ + SETTLED_HZ
+            val midOn = currentMidDuckDb < -SETTLED_DB
             if (lowOn) updateLowCoefficients()
             if (highOn) updateHighCoefficients()
+            if (midOn) updateMidCoefficients()
 
             repeat(subBlock) {
                 for (channel in 0 until channelCount) {
                     var sample = inputBuffer.short.toFloat() * invScale
                     if (lowOn) sample = lowPass(channel, sample)
                     if (highOn) sample = highPass(channel, sample)
+                    if (midOn) sample = midDuck(channel, sample)
                     outputBuffer.putShort(PcmBoundary.clamp16FromFloat(sample))
                 }
             }
@@ -329,6 +382,7 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         if (!filterStateDirty) return
         lowState.fill(0f)
         highState.fill(0f)
+        midState.fill(0f)
         filterStateDirty = false
     }
 
@@ -481,6 +535,31 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         return value
     }
 
+    /** RBJ peaking EQ centered at [VOCAL_DUCK_CENTER_HZ] (Q = [VOCAL_DUCK_Q]) for vocal-band pocket ducking. */
+    private fun updateMidCoefficients() {
+        if (sampleRate <= 0) return
+        val a = 10.0.pow(currentMidDuckDb / 40.0)
+        val w0 = 2.0 * Math.PI * VOCAL_DUCK_CENTER_HZ / sampleRate
+        val cosw = cos(w0)
+        val alpha = sin(w0) / (2.0 * VOCAL_DUCK_Q)
+        val a0 = 1.0 + alpha / a
+        midB0 = ((1.0 + alpha * a) / a0).toFloat()
+        midB1 = ((-2.0 * cosw) / a0).toFloat()
+        midB2 = ((1.0 - alpha * a) / a0).toFloat()
+        midA1 = midB1
+        midA2 = ((1.0 - alpha / a) / a0).toFloat()
+    }
+
+    private fun midDuck(channel: Int, input: Float): Float {
+        val i = channel * 2
+        val z1 = midState[i]
+        val z2 = midState[i + 1]
+        val y = midB0 * input + z1
+        midState[i] = midB1 * input - midA1 * y + z2
+        midState[i + 1] = midB2 * input - midA2 * y
+        return y
+    }
+
     companion object {
         private const val TAG = "BitChordTransitionFilter"
 
@@ -492,6 +571,14 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
 
         /** Nothing musical wants the low end lifted above this, and a typo shouldn't be able to. */
         const val MAX_HIGH_PASS_HZ = 2_000f
+
+        /** Maximum vocal-band pocket attenuation in dB. */
+        const val MAX_MID_DUCK_DB = -9f
+
+        /** Center frequency and Q of the vocal-band peaking EQ (~450 Hz – 3.5 kHz presence band). */
+        private const val VOCAL_DUCK_CENTER_HZ = 1_400f
+        private const val VOCAL_DUCK_Q = 0.7f
+        private const val SETTLED_DB = 0.05f
 
         private const val MIN_HZ = 10f
         private const val BYTES_PER_SAMPLE = 2
@@ -555,6 +642,10 @@ interface TransitionFilters {
     /** The track fading out — the ghost player. */
     fun outgoing(lowPassHz: Float, highPassHz: Float)
 
+    /** Vocal-band pocket attenuation in dB (0f = off, negative = duck) on each side's sink. */
+    fun incomingMidDuck(db: Float) = Unit
+    fun outgoingMidDuck(db: Float) = Unit
+
     /**
      * How far ahead of the speaker each side's filter is running, in that
      * track's media milliseconds — see [TransitionFilterProcessor.leadUs].
@@ -574,6 +665,8 @@ interface TransitionFilters {
     fun open() {
         incoming(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
         outgoing(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
+        incomingMidDuck(0f)
+        outgoingMidDuck(0f)
     }
 
     /** For callers with no audio sink to filter — tests, and the default wiring. */

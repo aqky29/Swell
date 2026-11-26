@@ -44,7 +44,7 @@ class LoopMixRenderer(val sampleRate: Int) : AutoCloseable {
         deck.knotFrames, deck.knotPositions, deck.runOn, deck.stopAt, deck.preroll, deck.level,
     )
 
-    /** Automation over mix seconds: [KIND_GAIN] (linear), [KIND_LOW_DB] (250 Hz shelf), [KIND_HIGH_PASS_HZ]. */
+    /** Automation over mix seconds: [KIND_GAIN], [KIND_LOW_DB] (250 Hz shelf), [KIND_HIGH_PASS_HZ], [KIND_PITCH_SEMITONES]. */
     fun setEnvelope(index: Int, kind: Int, times: DoubleArray, values: FloatArray, exponential: Boolean = false) =
         nativeSetEnvelope(handle, index, kind, times, values, exponential)
 
@@ -75,6 +75,7 @@ class LoopMixRenderer(val sampleRate: Int) : AutoCloseable {
         const val KIND_GAIN = 0
         const val KIND_LOW_DB = 1
         const val KIND_HIGH_PASS_HZ = 2
+        const val KIND_PITCH_SEMITONES = 3
 
         val available: Boolean = runCatching { System.loadLibrary("swell_loopmix") }
             .onFailure { Log.w("BitChordLoopMix", "Loop mix renderer unavailable", it) }

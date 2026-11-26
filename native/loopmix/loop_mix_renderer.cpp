@@ -116,12 +116,14 @@ void Renderer::prepare() {
     // written well ahead of the speaker, so latency costs nothing, and an even
     // load keeps the playback thread's blocks short.
     deck.stretch.presetCheaper(2, float(sampleRate_), true);
+    deck.stretch.setTransposeSemitones(0.f);
     deck.started = false;
     deck.finished = deck.left.empty() || deck.knotTimes.size() < 2;
     deck.shelf.bypass();
     deck.highPass.bypass();
     deck.shelfDb = 0;
     deck.highPassFreq = 0;
+    deck.lastPitchSemitones = 0;
   }
 }
 
@@ -184,6 +186,15 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
     }
     float* seekInput[2] = {inLeft_.data(), inRight_.data()};
     deck.stretch.reset();
+    if (!deck.pitchSemitones.empty()) {
+      const float initialPitch = deck.pitchSemitones.at(blockStart);
+      deck.lastPitchSemitones = initialPitch;
+      // Tonality limit ~8 kHz keeps cymbals/percussion crisp while shifting harmonic content.
+      deck.stretch.setTransposeSemitones(initialPitch, float(8000.0 / sr));
+    } else {
+      deck.lastPitchSemitones = 0.f;
+      deck.stretch.setTransposeSemitones(0.f);
+    }
     deck.stretch.seek(seekInput, seekLength, rate);
     deck.readPos = double(first + seekLength);
     deck.started = true;
@@ -224,6 +235,18 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
   if (int(outLeft_.size()) < frames) {
     outLeft_.resize(frames);
     outRight_.resize(frames);
+  }
+  if (!deck.pitchSemitones.empty()) {
+    const float targetPitch = deck.pitchSemitones.at((blockStart + blockEnd) / 2.0);
+    if (std::abs(targetPitch - deck.lastPitchSemitones) > 0.005f) {
+      deck.lastPitchSemitones = targetPitch;
+      if (std::abs(targetPitch) < 0.005f) {
+        deck.lastPitchSemitones = 0.f;
+        deck.stretch.setTransposeSemitones(0.f);
+      } else {
+        deck.stretch.setTransposeSemitones(targetPitch, float(8000.0 / sr));
+      }
+    }
   }
   float* input[2] = {inLeft_.data(), inRight_.data()};
   float* output[2] = {outLeft_.data(), outRight_.data()};

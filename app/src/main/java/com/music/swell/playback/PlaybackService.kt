@@ -1896,6 +1896,12 @@ class PlaybackService : MediaLibraryService() {
                 override fun outgoing(lowPassHz: Float, highPassHz: Float) =
                     spareFilter.setCutoffs(lowPassHz, highPassHz)
 
+                override fun incomingMidDuck(db: Float) =
+                    activeFilter.setMidDuckDb(db)
+
+                override fun outgoingMidDuck(db: Float) =
+                    spareFilter.setMidDuckDb(db)
+
                 override fun incomingLeadMs(): Long = activeFilter.leadUs / 1000
 
                 override fun outgoingLeadMs(): Long = spareFilter.leadUs / 1000
@@ -1950,6 +1956,7 @@ class PlaybackService : MediaLibraryService() {
                 }
             },
             syncedLines = ::loopMixLyrics,
+            onExactLyrics = trackAnalyzer::registerExactLyrics,
             loudnessGain = ::loudnessGainFor,
             onMixPositionJump = { wrapped -> (mediaSession?.player as? SessionPlayer)?.announceMixPosition(wrapped) },
         )

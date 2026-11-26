@@ -67,15 +67,33 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
 
     private val tracker = BeatTracker(
         modelPath = {
-            java.io.File(context.filesDir, BeatTracker.RETIRED_MODEL_ASSET).delete()
+            for (retired in BeatTracker.RETIRED_MODEL_ASSETS) {
+                java.io.File(context.filesDir, retired).delete()
+            }
             unpackedAsset(BeatTracker.MODEL_ASSET)
         },
         inferenceThreads = { AppSettings.automixPerformanceMode.value.inferenceThreads },
     )
     private val vocals = VocalTracker(
-        modelPath = { unpackedAsset(VocalTracker.MODEL_ASSET) },
+        modelPath = {
+            java.io.File(context.filesDir, VocalTracker.RETIRED_MODEL_ASSET).delete()
+            unpackedAsset(VocalTracker.MODEL_ASSET)
+        },
         inferenceThreads = { AppSettings.automixPerformanceMode.value.inferenceThreads },
     )
+
+    /**
+     * Exact word-synced / end-timed sung spans registered for a track. When present, [region]
+     * synthesizes the vocal curve directly from the spans and skips the vocal ONNX model.
+     */
+    private val exactLyrics = ConcurrentHashMap<String, List<LoopMix.Span>>()
+
+    /** Registers word-synced / end-timed lyric spans for [trackId] so vocal inference can be bypassed. */
+    fun registerExactLyrics(trackId: String, spans: List<LoopMix.Span>) {
+        if (hasExactLyrics(spans)) {
+            exactLyrics[trackId] = spans
+        }
+    }
 
     init {
         // The shared trackers report model failures and their timings through
@@ -1099,10 +1117,11 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // window, so its stereo buffer is paid for once. The spans match the loop mix's searches:
         // its incoming loop is looked for in the first 45 s, its outgoing one in the last 60.
         val span = modelWindowSeconds()
-        // Spans that the windows tile exactly, overlaps included: one window more
-        // here is a whole extra pass of both models.
-        val headEnd = minOf(effectiveDuration, HEAD_MODEL_WINDOWS * span - (HEAD_MODEL_WINDOWS - 1) * WINDOW_OVERLAP_SECONDS)
-        val tailStart = max(0.0, effectiveDuration - (TAIL_MODEL_WINDOWS * span - (TAIL_MODEL_WINDOWS - 1) * WINDOW_OVERLAP_SECONDS))
+        // With dynamic-length vocal inference, each window now covers a full BeatTracker chunk
+        // (~29.76 s), so 2 head windows (~45 s) and 2 tail windows (~58.5 s) cover LoopMix's search
+        // spans in 4 passes instead of 5.
+        val headEnd = minOf(effectiveDuration, max(LoopMix.IN_SEARCH_SEC, span))
+        val tailStart = max(0.0, effectiveDuration - minOf(LoopMix.OUT_SEARCH_SEC, TAIL_MODEL_WINDOWS * span - (TAIL_MODEL_WINDOWS - 1) * WINDOW_OVERLAP_SECONDS))
         val regions = ArrayList<Region>()
         for ((from, to) in modelWindows(headEnd, tailStart, effectiveDuration, span)) {
             // Checked between windows: an abort leaves a window missing, which
@@ -1111,7 +1130,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             // standing in. A result assembled out of a half-finished analysis
             // is worse than none.
             if (stopped) return WholeTrack(null)
-            region(openSource, from, to, features)?.let(regions::add)
+            region(openSource, from, to, features, trackId = trackId)?.let(regions::add)
         }
         if (stopped) return WholeTrack(null)
 
@@ -1125,6 +1144,11 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // head is what a track uses when it is the *incoming* side of a different transition.
         val leading = tailGrid ?: headGrid
 
+        val vocalSource = when {
+            exactLyrics.containsKey(trackId) && regions.any { it.vocalMask != null } -> "lyrics"
+            regions.any { it.vocalMask != null } -> "model"
+            else -> "dsp"
+        }
         Log.d(
             TAG,
             "Analysed $trackId: bpm=${leading?.bpm ?: features.bpm} " +
@@ -1134,7 +1158,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 "grid=${if (leading != null) "model" else "dsp"} " +
                 "beats=${headGrid?.beats?.size ?: 0}+${tailGrid?.beats?.size ?: 0} " +
                 "downbeats=${headGrid?.downbeats?.size ?: 0}+${tailGrid?.downbeats?.size ?: 0} " +
-                "vocalMask=${if (regions.any { it.vocalMask != null }) "model" else "dsp"} " +
+                "vocalMask=$vocalSource " +
                 "windows=${regions.size} vocalWindows=${regions.count { it.vocalWindow != null }}",
         )
 
@@ -1199,13 +1223,16 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     )
 
     /**
-     * Seconds of audio one model window covers: the vocal model's fixed input,
-     * which is the shorter of the two models' (the beat model's 1500 frames run
-     * to ~30 s). One window is then exactly one inference of each.
+     * Seconds of audio one model window covers: bounded by [BeatTracker.WINDOW_SECONDS] (~29.76 s)
+     * and the dynamic vocal model's [VocalTracker.MAX_FRAMES] ceiling (~32.5 s), so one window is
+     * still one single inference pass of each model.
      */
     private fun modelWindowSeconds(): Double =
         if (VocalSpectrogram.available) {
-            (VocalTracker.FIXED_FRAMES - 2) * VocalSpectrogram.hop / VocalSpectrogram.sampleRate
+            minOf(
+                BeatTracker.WINDOW_SECONDS,
+                (VocalTracker.MAX_FRAMES - 2) * VocalSpectrogram.hop / VocalSpectrogram.sampleRate,
+            )
         } else {
             BeatTracker.WINDOW_SECONDS
         }
@@ -1311,6 +1338,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         endSeconds: Double,
         features: TrackFeatures.Features?,
         deriveFeatures: Boolean = false,
+        trackId: String? = null,
     ): Region? {
         val decoded = openSource()?.use { AudioDecoder.decodeRegionStereo(it, startSeconds, endSeconds) { stopped } }
             ?: run {
@@ -1339,7 +1367,16 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // process was dying. Same reasoning [derived] already had, one level further out.
         val inputs = regionInputs(stereo, seconds, deriveFeatures)
 
-        val vocalValues = if (features != null) vocalValues(stereo) else null
+        val vocalValues = if (features != null) {
+            val synced = trackId?.let(exactLyrics::get)
+            if (synced != null) {
+                vocalValuesFromLyrics(synced, actualStart, seconds, VocalSpectrogram.frameRate)
+            } else {
+                vocalValues(stereo)
+            }
+        } else {
+            null
+        }
         return Region(
             grid = inputs.forModel?.let { tracker.track(it, offsetSeconds = actualStart) },
             vocalMask = if (features != null && vocalValues != null) vocalMask(vocalValues, features, actualStart) else null,
@@ -1432,10 +1469,10 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      */
     private fun vocalValues(stereo: AudioDecoder.StereoPcm): FloatArray? {
         if (!VocalSpectrogram.available) return null
-        // [VocalTracker.track] refuses anything wider than its graph, so a window that came back a
-        // little long is trimmed. Two frames of margin absorb the ±1 sample a rate conversion can
-        // land on.
-        val maxSeconds = (VocalTracker.FIXED_FRAMES - 2) * VocalSpectrogram.hop / VocalSpectrogram.sampleRate
+        // [VocalTracker.track] bounds single-pass inference to [VocalTracker.MAX_FRAMES], so a
+        // window that came back slightly over is trimmed. Two frames of margin absorb ±1 sample
+        // from rate conversion.
+        val maxSeconds = (VocalTracker.MAX_FRAMES - 2) * VocalSpectrogram.hop / VocalSpectrogram.sampleRate
         val maxSamples = (maxSeconds * stereo.sampleRate).toInt().coerceAtMost(stereo.left.size)
         if (maxSamples <= 0) return null
         val left = if (maxSamples < stereo.left.size) stereo.left.copyOf(maxSamples) else stereo.left
@@ -1574,6 +1611,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         badRenditions.clear()
         triedRenditions.clear()
         discarded.clear()
+        exactLyrics.clear()
         tracker.release()
         vocals.release()
     }
@@ -1588,12 +1626,21 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
          */
         const val NEUTRAL_VOCAL = 0.2
 
-        /** Model windows over the opening (~45 s) and the ending (~68 s); see [modelWindowSeconds]. */
+        /** Model windows over the opening (~45 s) and the ending (~58.5 s); see [modelWindowSeconds]. */
         const val HEAD_MODEL_WINDOWS = 2
-        const val TAIL_MODEL_WINDOWS = 3
+        const val TAIL_MODEL_WINDOWS = 2
 
         /** Overlap between neighbouring model windows, so a beat on a seam is seen from both sides. */
         const val WINDOW_OVERLAP_SECONDS = 1.0
+
+        fun hasExactLyrics(spans: List<LoopMix.Span>): Boolean = VocalTracker.hasExactLyrics(spans)
+
+        fun vocalValuesFromLyrics(
+            spans: List<LoopMix.Span>,
+            actualStart: Double,
+            seconds: Double,
+            frameRate: Double,
+        ): FloatArray = VocalTracker.vocalCurveFromLyrics(spans, actualStart, seconds, frameRate)
 
         /**
          * How much more than the average-bitrate estimate of the opening window
