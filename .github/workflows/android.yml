@@ -65,10 +65,11 @@ jobs:
       env:
         TARGET_ABI: ${{ inputs.abi || 'arm64-v8a' }}
       run: |
+        HEAP_FLAGS=(-Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" -Pkotlin.daemon.jvmargs="-Xmx4g")
         if [ "${TARGET_ABI}" = "all" ]; then
-          ./gradlew :app:assembleProdRelease :wearos:assembleProdRelease
+          ./gradlew "${HEAP_FLAGS[@]}" :app:assembleProdRelease :wearos:assembleProdRelease
         else
-          ./gradlew :app:assembleProdRelease -Pswell.abi="${TARGET_ABI}"
+          ./gradlew "${HEAP_FLAGS[@]}" :app:assembleProdRelease -Pswell.abi="${TARGET_ABI}"
         fi
         ls -lh app/build/outputs/apk/prod/release/*.apk
 
